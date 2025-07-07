@@ -1,4 +1,4 @@
-import express, { Request, RequestHandler, Response } from 'express';
+import express, { Request, RequestHandler } from 'express';
 import rateLimit from 'express-rate-limit';
 import * as cookie from 'cookie';
 import { SignJWT, jwtVerify } from 'jose';
@@ -28,7 +28,7 @@ let users: Record<string, string> = {};
 async function loadUsers() {
     try {
         if (!USER_FILE) {
-            throw new Error('USER_FILE enviroment variable is not set.');
+            throw new Error('USER_FILE environment variable is not set.');
         }
         users = JSON.parse(await fs.readFile(USER_FILE, 'utf-8'));
         console.log(`Successfully loaded ${Object.keys(users).length} users from ${USER_FILE}`);
@@ -39,38 +39,56 @@ async function loadUsers() {
 }
 loadUsers();
 
-function getOriginalUrl(req: Request) {
+function getOriginalUrl(req: Request): string {
     const proto = req.header('X-Forwarded-Proto') ?? 'https';
     const host = req.header('X-Forwarded-Host') ?? req.hostname;
     const uri = req.header('X-Forwarded-Uri') ?? '/';
     return `${proto}://${host}${uri}`;
 }
 
+const getPageHTML = (title: string, body: string): string => `
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${title}</title>
+        <!-- Verlinke zur externen CSS-Datei -->
+        <link rel="stylesheet" href="/styles.css">
+    </head>
+    <body>
+        <div class="container">
+            ${body}
+        </div>
+    </body>
+    </html>
+`;
+
 app.use(express.urlencoded({ extended: false }));
+
+app.use(express.static('public'));
 
 app.get('/', (req, res) => {
     res.redirect('/auth');
 });
 
-const authHandler: RequestHandler = async (req, res, next) => {
+const authHandler: RequestHandler = async (req, res) => {
     const originalUrl = getOriginalUrl(req);
-
     const cookies = cookie.parse(req.headers.cookie || '');
     const token = cookies[COOKIE_NAME];
 
     if (token) {
         try {
             await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
-            res.sendStatus(200);
+            const loggedInBody = `
+                <h1>Authenticated</h1>
+                <p>You are successfully authenticated and can access the protected service.</p>
+                <a href="/logout">Logout</a>
+            `;
+            res.status(200).send(getPageHTML('Authenticated', loggedInBody));
             return;
         } catch (error) {
-            res.setHeader('Set-Cookie', cookie.serialize(COOKIE_NAME, '', {
-                maxAge: 0,
-                domain: DOMAIN,
-                httpOnly: true,
-                secure: true,
-                sameSite: 'strict'
-            }));
+            res.setHeader('Set-Cookie', cookie.serialize(COOKIE_NAME, '', { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict' }));
         }
     }
 
@@ -79,18 +97,16 @@ const authHandler: RequestHandler = async (req, res, next) => {
         user = req.body.username;
         pass = req.body.password;
     } else if (req.header('Authorization')?.startsWith('Basic ')) {
-        const [u, p] = Buffer.from(req.header('Authorization')!.split(' ')[1], 'base64')
-            .toString()
-            .split(':', 2);
-        user = u;
-        pass = p;
+        const [u, p] = Buffer.from(req.header('Authorization')!.split(' ')[1], 'base64').toString().split(':', 2);
+        user = u; pass = p;
     }
 
     let loginMessage = '<h1>Please Login</h1>';
+    if (req.method === 'POST' && user) {
+        loginMessage = '<h1 style="color: #d93025;">Invalid username or password!</h1>';
+    }
 
     if (user && pass) {
-        loginMessage = '<h1 style="color: red;">Invalid username or password!</h1>';
-
         const hash = users[user];
         const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWvVIm_societ';
         const hashToVerify = hash || DUMMY_HASH;
@@ -103,14 +119,7 @@ const authHandler: RequestHandler = async (req, res, next) => {
                     .setIssuer(JWT_ISSUER)
                     .setExpirationTime(`${COOKIE_MAX_AGE / 1000}s`)
                     .sign(JWT_SECRET);
-
-                const sc = cookie.serialize(COOKIE_NAME, jwt, {
-                    httpOnly: true,
-                    secure: true,
-                    maxAge: COOKIE_MAX_AGE / 1000,
-                    sameSite: 'strict',
-                    domain: DOMAIN
-                });
+                const sc = cookie.serialize(COOKIE_NAME, jwt, { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE / 1000, sameSite: 'strict', domain: DOMAIN });
                 res.setHeader('Set-Cookie', sc);
                 res.redirect(originalUrl);
                 return;
@@ -120,36 +129,27 @@ const authHandler: RequestHandler = async (req, res, next) => {
         }
     }
 
-    res.status(401).send(`
-        <!doctype html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Login</title>
-        </head>
-        <body>
-            ${loginMessage}
-            <form method="post" action="/auth">
-                <input name="username" placeholder="User" required autocomplete="username" />
-                <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
-                <button type="submit">Login</button>
-            </form>
-        </body>
-        </html>
-        `);
+    const loginFormBody = `
+        ${loginMessage}
+        <form method="post" action="/auth">
+            <input name="username" placeholder="Username" required autocomplete="username" />
+            <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
+            <button type="submit">Login</button>
+        </form>
+    `;
+    res.status(401).send(getPageHTML('Login', loginFormBody));
 };
 
 const logoutHandler: RequestHandler = (req, res) => {
-    res.setHeader('Set-Cookie', cookie.serialize(COOKIE_NAME, '', {
-        maxAge: 0,
-        domain: DOMAIN,
-        httpOnly: true,
-        secure: true,
-        sameSite: 'strict'
-    }));
-    res.status(200).send('<h1>You have been logged out.</h1><p><a href="/">Login again</a></p>');
-}
+    res.setHeader('Set-Cookie', cookie.serialize(COOKIE_NAME, '', { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict' }));
+
+    const logoutBody = `
+        <h1>Logged Out</h1>
+        <p>You have been successfully logged out.</p>
+        <a href="/">Login again</a>
+    `;
+    res.status(200).send(getPageHTML('Logged Out', logoutBody));
+};
 
 app.use('/auth', loginLimiter);
 app.all('/auth', authHandler);
@@ -158,7 +158,7 @@ app.get('/logout', logoutHandler);
 app.listen(PORT, () => {
     console.log(`ForwardAuth-Server running on port: ${PORT}`);
     if (!DOMAIN) {
-        console.warn('WARN: DOMAIN enviroment variable is not set. Cookies may not work across subdomains.');
+        console.warn('WARN: DOMAIN environment variable is not set. Cookies may not work across subdomains.');
     } else {
         console.log(`Cookies will be set for domain: ${DOMAIN}`);
     }

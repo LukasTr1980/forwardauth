@@ -1,0 +1,14 @@
+.git
+.gitignore
+.gitattributes
+
+node_modules
+.env
+users.json
+
+dist
+.tsbuildinfo
+
+Dockerfile
+docker-compose.yml
+README.md

@@ -48,6 +48,10 @@ function getOriginalUrl(req: Request) {
 
 app.use(express.urlencoded({ extended: false }));
 
+app.get('/', (req, res) => {
+    res.redirect('/auth');
+});
+
 const authHandler: RequestHandler = async (req, res, next) => {
     const originalUrl = getOriginalUrl(req);
 

@@ -16,9 +16,11 @@ COPY --from=deps /app/node_modules ./node_modules
 
 COPY --chown=appuser:appgroup . .
 
+RUN chmod +x /app/docker-entrypoint.sh
+
 USER appuser
 
 EXPOSE 3000
 
-ENTRYPOINT [ "/usr/local/bin/docker-entrypoint.sh" ]
+ENTRYPOINT [ "/app/docker-entrypoint.sh" ]
 CMD [ "npm", "run", "start" ]

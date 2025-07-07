@@ -21,8 +21,6 @@ const loginLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many login attempts from this IP, please try again after 15 minutes',
-
-    skip: (req) => req.method !== 'POST'
 });
 
 let users: Record<string, string> = {};
@@ -80,36 +78,42 @@ const authHandler: RequestHandler = async (req, res, next) => {
         const [u, p] = Buffer.from(req.header('Authorization')!.split(' ')[1], 'base64')
             .toString()
             .split(':', 2);
-        user = u; 
+        user = u;
         pass = p;
-    }
-
-    if (user && pass) {
-        const hash = users[user];
-        if (hash && await argon2.verify(hash, pass)) {
-            const jwt = await new SignJWT({ sub: user })
-                .setProtectedHeader({ alg: 'HS256' })
-                .setIssuer(JWT_ISSUER)
-                .setExpirationTime(`${COOKIE_MAX_AGE / 1000}s`)
-                .sign(JWT_SECRET);
-
-            const sc = cookie.serialize(COOKIE_NAME, jwt, {
-                httpOnly: true,
-                secure: true,
-                maxAge: COOKIE_MAX_AGE / 1000,
-                sameSite: 'strict',
-                domain: DOMAIN
-            });
-            res.setHeader('Set-Cookie', sc);
-            res.redirect(originalUrl);
-            return;
-        }
     }
 
     let loginMessage = '<h1>Please Login</h1>';
 
-    if (req.method === 'POST' && user) {
+    if (user && pass) {
         loginMessage = '<h1 style="color: red;">Invalid username or password!</h1>';
+
+        const hash = users[user];
+        const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWvVIm_societ';
+        const hashToVerify = hash || DUMMY_HASH;
+
+        try {
+            const isMatch = await argon2.verify(hashToVerify, pass);
+            if (isMatch && hash) {
+                const jwt = await new SignJWT({ sub: user })
+                    .setProtectedHeader({ alg: 'HS256' })
+                    .setIssuer(JWT_ISSUER)
+                    .setExpirationTime(`${COOKIE_MAX_AGE / 1000}s`)
+                    .sign(JWT_SECRET);
+
+                const sc = cookie.serialize(COOKIE_NAME, jwt, {
+                    httpOnly: true,
+                    secure: true,
+                    maxAge: COOKIE_MAX_AGE / 1000,
+                    sameSite: 'strict',
+                    domain: DOMAIN
+                });
+                res.setHeader('Set-Cookie', sc);
+                res.redirect(originalUrl);
+                return;
+            }
+        } catch (error) {
+            console.error('Internal error during argon2 verification:', error);
+        }
     }
 
     res.status(401).send(`
@@ -117,7 +121,7 @@ const authHandler: RequestHandler = async (req, res, next) => {
         <html lang="en">
         <head>
             <meta charset="UTF-8">
-            <meta name="viewport" content="width-device-width, initial-scale=1.0">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Login</title>
         </head>
         <body>

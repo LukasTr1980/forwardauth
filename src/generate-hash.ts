@@ -9,7 +9,7 @@ async function generateHash() {
         const password = await rl.question('Enter password for hashing: ');
 
         if (!password) {
-            console.error('\nError: password cannot be emtyp.');
+            console.error('\nError: password cannot be empty.');
             return;
         }
 

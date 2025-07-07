@@ -20,4 +20,5 @@ USER appuser
 
 EXPOSE 3000
 
+ENTRYPOINT [ "/usr/local/bin/docker-entrypoint.sh" ]
 CMD [ "npm", "run", "start" ]

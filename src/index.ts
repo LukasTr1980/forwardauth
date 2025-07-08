@@ -72,72 +72,79 @@ app.get('/', (req, res) => {
     res.redirect('/auth');
 });
 
-const authHandler: RequestHandler = async (req, res) => {
+const verifyHandler: RequestHandler = async (req, res) => {
+    try {
+        const cookies = cookie.parse(req.headers.cookie || '');
+        const token = cookies[COOKIE_NAME];
+        if (!token) {
+            throw new Error('No token found');
+        }
+        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
+        res.sendStatus(200);
+    } catch (error) {
+        res.sendStatus(401);
+    }
+};
+
+const loginPageHandler: RequestHandler = async (req, res) => {
     const originalUrl = getOriginalUrl(req);
-    const cookies = cookie.parse(req.headers.cookie || '');
-    const token = cookies[COOKIE_NAME];
 
-    if (token) {
-        try {
-            await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
-            const loggedInBody = `
-                <h1>Authenticated</h1>
-                <p>You are successfully authenticated and can access the protected service.</p>
-                <a href="/logout">Logout</a>
-            `;
-            res.status(200).send(getPageHTML('Authenticated', loggedInBody));
-            return;
-        } catch (error) {
-            res.setHeader('Set-Cookie', cookie.serialize(COOKIE_NAME, '', { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict' }));
-        }
-    }
-
-    let user: string | undefined, pass: string | undefined;
     if (req.method === 'POST') {
-        user = req.body.username;
-        pass = req.body.password;
-    } else if (req.header('Authorization')?.startsWith('Basic ')) {
-        const [u, p] = Buffer.from(req.header('Authorization')!.split(' ')[1], 'base64').toString().split(':', 2);
-        user = u; pass = p;
-    }
+        const user = req.body.username as string;
+        const pass = req.body.password as string;
 
-    let loginMessage = '<h1>Please Login</h1>';
-    if (req.method === 'POST' && user) {
-        loginMessage = '<h1 style="color: #d93025;">Invalid username or password!</h1>';
-    }
+        if (user && pass) {
+            const hash = users[user];
+            const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWvVIm_societ';
+            const hashToVerify = hash || DUMMY_HASH;
 
-    if (user && pass) {
-        const hash = users[user];
-        const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWvVIm_societ';
-        const hashToVerify = hash || DUMMY_HASH;
-
-        try {
-            const isMatch = await argon2.verify(hashToVerify, pass);
-            if (isMatch && hash) {
-                const jwt = await new SignJWT({ sub: user })
-                    .setProtectedHeader({ alg: 'HS256' })
-                    .setIssuer(JWT_ISSUER)
-                    .setExpirationTime(`${COOKIE_MAX_AGE / 1000}s`)
-                    .sign(JWT_SECRET);
-                const sc = cookie.serialize(COOKIE_NAME, jwt, { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE / 1000, sameSite: 'strict', domain: DOMAIN });
-                res.setHeader('Set-Cookie', sc);
-                res.redirect(originalUrl);
-                return;
+            try {
+                const isMatch = await argon2.verify(hashToVerify, pass);
+                if (isMatch && hash) {
+                    const jwt = await new SignJWT({ sub: user })
+                        .setProtectedHeader({ alg: 'HS256' })
+                        .setIssuer(JWT_ISSUER)
+                        .setExpirationTime(`${COOKIE_MAX_AGE / 1000}s`)
+                        .sign(JWT_SECRET)
+                    const sc = cookie.serialize(COOKIE_NAME, jwt, { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE / 1000, sameSite: 'strict', domain: DOMAIN});
+                    res.setHeader('Set-Cookie', sc);
+                    res.redirect(originalUrl);
+                    return;
+                }
+            } catch (error) {
+                console.error('Internal error during argon2 verification', error);
             }
-        } catch (error) {
-            console.error('Internal error during argon2 verification:', error);
         }
     }
 
-    const loginFormBody = `
-        ${loginMessage}
-        <form method="post" action="/auth">
-            <input name="username" placeholder="Username" required autocomplete="username" />
-            <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
-            <button type="submit">Login</button>
-        </form>
-    `;
-    res.status(401).send(getPageHTML('Login', loginFormBody));
+    try {
+        const cookies = cookie.parse(req.headers.cookie || '');
+        const token = cookies[COOKIE_NAME];
+        if (!token) throw new Error();
+        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
+
+        const loggedInBody = `
+            <h1>Authenticated</h1>
+            <p>You are successfully authenticated and can access other protected services.</p>
+            <p><a href="${originalUrl}">Go back to original destination</a> or <a href="/logout">Logout</a></p>
+        `;
+        res.status(200).send(getPageHTML('Authenticated', loggedInBody));
+        return;
+    } catch (error) {
+        let loginMessage = '<h1>Please Login</h1>';
+        if (req.method === 'POST') {
+            loginMessage = '<h1 style="color: #d93025;">Invalid username or password!</h1>';
+        }
+        const loginFormBody = `
+            ${loginMessage}
+            <form method="post" action="/auth">
+                <input name="username" placeholder="Username" required autocomplete="username" />
+                <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
+                <button type="submit">Login</button>
+            </form>
+        `;
+        res.status(200).send(getPageHTML('Login', loginFormBody));
+    }
 };
 
 const logoutHandler: RequestHandler = (req, res) => {
@@ -152,8 +159,9 @@ const logoutHandler: RequestHandler = (req, res) => {
 };
 
 app.use('/auth', loginLimiter);
-app.all('/auth', authHandler);
+app.all('/auth', loginPageHandler);
 app.get('/logout', logoutHandler);
+app.get('/verify', verifyHandler);
 
 app.listen(PORT, () => {
     console.log(`ForwardAuth-Server running on port: ${PORT}`);

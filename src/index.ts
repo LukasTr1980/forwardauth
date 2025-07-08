@@ -164,29 +164,31 @@ const loginPageHandler: RequestHandler = async (req, res) => {
             const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$WXl3a2tCbjVYcHpGNEoyRw$g5bC13aXAa/U0KprDD9P7x0BvJ2T1jcsjpQj5Ym+kIM';
             const hashToVerify = hash || DUMMY_HASH;
 
-            const isMatch = await argon2.verify(hashToVerify, pass).catch(err => {
-                console.error('Internal error during argon2 verification', err);
-                return false;
-            });
+            try {
+                const isMatch = await argon2.verify(hashToVerify, pass);
+                if (isMatch && hash) {
+                    console.log(`[loginPageHandler] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
 
-            if (isMatch && hash) {
-                console.log(`[loginPageHandler] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
+                    const jwt = await new SignJWT({ sub: user })
+                        .setProtectedHeader({ alg: 'HS256' })
+                        .setIssuer(JWT_ISSUER)
+                        .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
+                        .sign(JWT_SECRET);
 
-                const jwt = await new SignJWT({ sub: user })
-                    .setProtectedHeader({ alg: 'HS256' })
-                    .setIssuer(JWT_ISSUER)
-                    .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
-                    .sign(JWT_SECRET);
+                    const cookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'strict' };
+                    if (DOMAIN) cookieOptions.domain = DOMAIN;
 
-                const cookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'strict' };
-                if (DOMAIN) cookieOptions.domain = DOMAIN;
+                    res.setHeader('Set-Cookie', [
+                        cookie.serialize(COOKIE_NAME, jwt, cookieOptions),
+                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...cookieOptions, maxAge: 0 })
+                    ]);
 
-                res.setHeader('Set-Cookie', [
-                    cookie.serialize(COOKIE_NAME, jwt, cookieOptions),
-                    cookie.serialize(CSRF_COOKIE_NAME, '', { ...cookieOptions, maxAge: 0 })
-                ]);
-
-                res.redirect(validatedDestinationUri);
+                    res.redirect(validatedDestinationUri);
+                    return;
+                }
+            } catch (error) {
+                console.error('Internal error during argon2 verification', error);
+                res.status(500).send(getPageHTML('Error', '<h1>Internal Server Error</h1><p>An unexpected error occurred. Please try again later.</p>'));
                 return;
             }
         }

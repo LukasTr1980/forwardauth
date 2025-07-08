@@ -17,10 +17,12 @@ const COOKIE_MAX_AGE = +(process.env.COOKIE_MAX_AGE ?? 3600) * 1000;
 const USER_FILE = process.env.USER_FILE ?? path.resolve(__dirname, '../users.json');
 const DOMAIN = process.env.DOMAIN;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'example.com';
+const LOGIN_LIMITER_WINDOW_S = +(process.env.LOGIN_LIMITER_WINDOW_S ?? 15 * 60);
+const LOGIN_LIMITER_MAX = +(process.env.LOGIN_LIMITER_MAX ?? 10);
 
 const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 10,
+    windowMs: LOGIN_LIMITER_WINDOW_S * 1000,
+    max: LOGIN_LIMITER_MAX,
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many login attempts from this IP, please try again after 15 minutes',

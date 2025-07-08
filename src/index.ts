@@ -9,6 +9,10 @@ import helmet from 'helmet';
 import he from 'he';
 import { randomBytes } from 'crypto';
 
+interface User {
+    hash: string;
+}
+
 function getEnvAsNumber(key: string, defaultValue: number): number {
     const value = parseInt(process.env[key] ?? '', 10);
     return isNaN(value) ? defaultValue : value;
@@ -34,7 +38,7 @@ const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
 const CSRF_COOKIE_NAME = '__Host-csrf-token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const DOMAIN = process.env.DOMAIN;
-const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || '/';
+const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3000/auth';
 
 const app = express();
 app.disable('x-powered-by');
@@ -49,7 +53,7 @@ const loginLimiter = rateLimit({
     message: 'Too many login attempts from this IP, please try again after 15 minutes',
 });
 
-let users: Record<string, string> = {};
+let users: Record<string, User> = {};
 
 async function loadUsers() {
     try {
@@ -160,7 +164,8 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         console.log(`[loginPageHandler] Login attempt for user "${user}" from IP: ${sourceIp}`);
 
         if (user && pass) {
-            const hash = users[user];
+            const userObject = users[user];
+            const hash = userObject?.hash;
             const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$WXl3a2tCbjVYcHpGNEoyRw$g5bC13aXAa/U0KprDD9P7x0BvJ2T1jcsjpQj5Ym+kIM';
             const hashToVerify = hash || DUMMY_HASH;
 

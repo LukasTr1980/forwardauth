@@ -20,9 +20,9 @@ body {
 h1 {
     margin-top: 0;
     color: #1a1a1a;
+}
 .login-error {
     color: #d93025;
-}
 }
 form {
     display: flex;

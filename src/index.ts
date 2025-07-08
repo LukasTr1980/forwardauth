@@ -7,7 +7,7 @@ import fs from 'fs/promises';
 import path from 'path';
 
 const app = express();
-app.set('trust-proxy', 1);
+app.set('trust proxy', 1);
 
 const PORT = +(process.env.PORT ?? 3000);
 const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';

@@ -283,4 +283,4 @@ app.get('/verify', verifyHandler);
             console.log(`Cookies will be set for domain: ${DOMAIN}`);
         }
     })
-})
+})();

@@ -102,7 +102,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
 };
 
 const loginPageHandler: RequestHandler = async (req, res) => {
-    const redirectUri = (req.body.redirect_uri || req.query.redirect_uri) as string || undefined;
+    const redirectUri = (req.query.redirect_uri || (req.body && req.body.redirect_uri)) as string || undefined;
     const destinationUri = redirectUri || getOriginalUrl(req);
 
     const sourceIp = req.ip;

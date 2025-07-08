@@ -16,6 +16,7 @@ const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const COOKIE_MAX_AGE = +(process.env.COOKIE_MAX_AGE ?? 3600) * 1000;
 const USER_FILE = process.env.USER_FILE ?? path.resolve(__dirname, '../users.json');
 const DOMAIN = process.env.DOMAIN;
+const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'example.com';
 
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -81,22 +82,29 @@ const verifyHandler: RequestHandler = async (req, res) => {
     try {
         const cookies = cookie.parse(req.headers.cookie || '');
         const token = cookies[COOKIE_NAME];
-        if (!token) {
-            console.warn(`[verifyHandler] Verification failed for IP ${sourceIp}: No token provided.`);
-            throw new Error('No token found');
-        }
+        if (!token) throw new Error('No token found');
+
         await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
         console.log(`[verifyHandler] Verification successfull for IP: ${sourceIp}`);
         res.sendStatus(200);
+        return;
     } catch (error) {
         const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid or expired token';
         console.warn(`[verifyHandler] Verification failed for IP ${sourceIp}: ${reason}`);
-        res.sendStatus(401);
+        
+        const originalUrl = getOriginalUrl(req);
+        const loginRedirectUrl = new URL(LOGIN_REDIRECT_URL);
+
+        loginRedirectUrl.searchParams.set('redirect_uri', originalUrl);
+
+        res.redirect(loginRedirectUrl.toString());
     }
 };
 
 const loginPageHandler: RequestHandler = async (req, res) => {
-    const originalUrl = getOriginalUrl(req);
+    const redirectUri = req.query.redirect_uri as string || undefined;
+    const destinationUri = redirectUri || getOriginalUrl(req);
+
     const sourceIp = req.ip;
 
     if (req.method === 'POST') {
@@ -122,7 +130,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
                         .sign(JWT_SECRET)
                     const sc = cookie.serialize(COOKIE_NAME, jwt, { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE / 1000, sameSite: 'strict', domain: DOMAIN});
                     res.setHeader('Set-Cookie', sc);
-                    res.redirect(originalUrl);
+                    res.redirect(destinationUri);
                     return;
                 }
             } catch (error) {
@@ -141,7 +149,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         const loggedInBody = `
             <h1>Authenticated</h1>
             <p>You are successfully authenticated and can access other protected services.</p>
-            <p><a href="${originalUrl}">Go back to original destination</a> or <a href="/logout">Logout</a></p>
+            <p><a href="${destinationUri}">Go back to original destination</a> or <a href="/logout">Logout</a></p>
         `;
         res.status(200).send(getPageHTML('Authenticated', loggedInBody));
         return;

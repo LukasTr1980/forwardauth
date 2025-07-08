@@ -15,7 +15,7 @@ interface User {
 
 function getEnvAsNumber(key: string, defaultValue: number): number {
     const value = parseInt(process.env[key] ?? '', 10);
-    return isNaN(value) ? defaultValue : value;
+    return Number.isFinite(value) ? value : defaultValue;
 }
 
 const secretEnv = process.env.JWT_SECRET;
@@ -26,10 +26,6 @@ if (!secretEnv) {
 
 const JWT_SECRET = new TextEncoder().encode(secretEnv);
 const USER_FILE = process.env.USER_FILE ?? path.resolve(__dirname, '../users.json');
-if (!USER_FILE) {
-    console.error('FATAL: USER_FILE environment variable must be set to a valid path.');
-    process.exit(1);
-}
 const PORT = getEnvAsNumber('PORT', 3000);
 const COOKIE_MAX_AGE_S = getEnvAsNumber('COOKIE_MAX_AGE_S', 3600);
 const LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('LOGIN_LIMITER_WINDOW_S', 15 * 60);
@@ -43,6 +39,11 @@ const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3
 const app = express();
 app.disable('x-powered-by');
 app.use(helmet());
+app.use(helmet.contentSecurityPolicy({
+    directives: {
+        defaultSrc: ["'self'"],
+    }
+}));
 app.set('trust proxy', 1);
 
 const loginLimiter = rateLimit({
@@ -74,9 +75,7 @@ function validateRedirectUri(uri: string): string {
         if (DOMAIN && (url.hostname === DOMAIN || url.hostname.endsWith(`.${DOMAIN}`))) {
             return uri;
         }
-        if (!url.hostname) {
-            return uri;
-        }
+
         console.warn(`[validateRedirectUri] Blocked potential open redirect to: ${uri}`);
         return defaultRedirect;
     } catch (error) {
@@ -125,7 +124,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         const token = cookies[COOKIE_NAME];
         if (!token) throw new Error('No token found');
 
-        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
+        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
         console.log(`[verifyHandler] Verification successful for IP: ${sourceIp}`);
         res.sendStatus(200);
         return;
@@ -142,6 +141,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
 };
 
 const loginPageHandler: RequestHandler = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
     const rawRedirectUri = (req.query.redirect_uri || (req.body && req.body.redirect_uri)) as string;
     const validatedDestinationUri = validateRedirectUri(rawRedirectUri || getOriginalUrl(req));
     const safeDestinationUri = he.encode(validatedDestinationUri);
@@ -180,12 +181,14 @@ const loginPageHandler: RequestHandler = async (req, res) => {
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
                         .sign(JWT_SECRET);
 
-                    const cookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'strict' };
-                    if (DOMAIN) cookieOptions.domain = DOMAIN;
+                    const sessionCookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'strict' };
+                    if (DOMAIN) sessionCookieOptions.domain = DOMAIN;
+
+                    const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
 
                     res.setHeader('Set-Cookie', [
-                        cookie.serialize(COOKIE_NAME, jwt, cookieOptions),
-                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...cookieOptions, maxAge: 0 })
+                        cookie.serialize(COOKIE_NAME, jwt, sessionCookieOptions),
+                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...csrfCookieOptions, maxAge: 0 })
                     ]);
 
                     res.redirect(validatedDestinationUri);
@@ -197,13 +200,13 @@ const loginPageHandler: RequestHandler = async (req, res) => {
                 return;
             }
         }
-        console.warn(`[loginPageHandler] FAILED: Invalid login attempt for user "${user}" from IP: ${sourceIp}`);
+        console.warn(`[loginPageHandler] FAILED: Authentication attempt for user "${user}" from IP: ${sourceIp}`);
     }
 
     try {
         const token = cookies[COOKIE_NAME];
         if (!token) throw new Error('Not logged in');
-        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
+        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
 
         const loggedInBody = `
             <h1>Authenticated</h1>
@@ -214,14 +217,13 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         return;
     } catch (error) {
         const csrfToken = randomBytes(32).toString('hex');
-        const cookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict' };
-        if (DOMAIN) cookieOptions.domain = DOMAIN;
-        res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, cookieOptions));
+        const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
 
-        let loginMessage = '<h1>Please Login</h1>';
-        if (req.method === 'POST') {
-            loginMessage = '<h1 style="color: #d93025;">Invalid username or password!</h1>';
-        }
+        res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
+
+        const loginMessage = req.method === 'POST'
+            ? '<h1 style="color: #d93025;">Invalid username or password!</h1>'
+            : '<h1>Please Login</h1>';
 
         const loginFormBody = `
             ${loginMessage}
@@ -239,14 +241,18 @@ const loginPageHandler: RequestHandler = async (req, res) => {
 };
 
 const logoutHandler: RequestHandler = (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
     console.log(`[logoutHandler] User logged out from IP :${req.ip}`);
 
-    const cookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict' };
-    if (!DOMAIN) delete cookieOptions.domain;
+    const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict' };
+    if (!DOMAIN) delete sessionCookieOptions.domain;
+
+    const csrfCookieOptions: cookie.SerializeOptions = { maxAge: 0, secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
 
     res.setHeader('Set-Cookie', [
-        cookie.serialize(COOKIE_NAME, '', cookieOptions),
-        cookie.serialize(CSRF_COOKIE_NAME, '', cookieOptions)
+        cookie.serialize(COOKIE_NAME, '', sessionCookieOptions),
+        cookie.serialize(CSRF_COOKIE_NAME, '', csrfCookieOptions)
     ]);
 
     const logoutBody = `
@@ -261,8 +267,8 @@ app.get('/', (req, res) => {
     res.redirect('/auth');
 })
 
-app.use('/auth', loginLimiter);
-app.all('/auth', loginPageHandler);
+app.post('/auth', loginLimiter, loginPageHandler);
+app.get('/auth', loginPageHandler);
 app.get('/logout', logoutHandler);
 app.get('/verify', verifyHandler);
 

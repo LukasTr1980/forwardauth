@@ -115,7 +115,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
 
         if (user && pass) {
             const hash = users[user];
-            const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWvVIm_societ';
+            const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$WXl3a2tCbjVYcHpGNEoyRw$g5bC13aXAa/U0KprDD9P7x0BvJ2T1jcsjpQj5Ym+kIM';
             const hashToVerify = hash || DUMMY_HASH;
 
             try {

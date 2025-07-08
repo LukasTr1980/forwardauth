@@ -200,7 +200,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
                 return;
             }
         }
-        console.warn(`[loginPageHandler] FAILED: Authentication attempt for user "${user}" from IP: ${sourceIp}`);
+        console.warn(`[loginPageHandler] FAILED: Authentication attempt from IP: ${sourceIp}`);
     }
 
     try {
@@ -222,7 +222,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
 
         const loginMessage = req.method === 'POST'
-            ? '<h1 style="color: #d93025;">Invalid username or password!</h1>'
+            ? '<h1 class="login-error">Invalid username or password!</h1>'
             : '<h1>Please Login</h1>';
 
         const loginFormBody = `

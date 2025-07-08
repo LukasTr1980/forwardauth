@@ -102,7 +102,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
 };
 
 const loginPageHandler: RequestHandler = async (req, res) => {
-    const redirectUri = req.query.redirect_uri as string || undefined;
+    const redirectUri = (req.body.redirect_uri || req.query.redirect_uri) as string || undefined;
     const destinationUri = redirectUri || getOriginalUrl(req);
 
     const sourceIp = req.ip;
@@ -161,6 +161,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         const loginFormBody = `
             ${loginMessage}
             <form method="post" action="/auth">
+                <input type="hidden" name="redirect_uri" value="${destinationUri}" />
                 <input name="username" placeholder="Username" required autocomplete="username" />
                 <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
                 <button type="submit">Login</button>

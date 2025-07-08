@@ -7,6 +7,8 @@ import fs from 'fs/promises';
 import path from 'path';
 
 const app = express();
+app.set('trust-proxy', 1);
+
 const PORT = +(process.env.PORT ?? 3000);
 const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
 const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET);
@@ -73,25 +75,35 @@ app.get('/', (req, res) => {
 });
 
 const verifyHandler: RequestHandler = async (req, res) => {
+    const sourceIp = req.ip;
+    console.log(`[verifyHandler] Verifying request from IP: ${sourceIp}`);
+
     try {
         const cookies = cookie.parse(req.headers.cookie || '');
         const token = cookies[COOKIE_NAME];
         if (!token) {
+            console.warn(`[verifyHandler] Verification failed for IP ${sourceIp}: No token provided.`);
             throw new Error('No token found');
         }
         await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER });
+        console.log(`[verifyHandler] Verification successfull for IP: ${sourceIp}`);
         res.sendStatus(200);
     } catch (error) {
+        const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid or expired token';
+        console.warn(`[verifyHandler] Verification failed for IP ${sourceIp}: ${reason}`);
         res.sendStatus(401);
     }
 };
 
 const loginPageHandler: RequestHandler = async (req, res) => {
     const originalUrl = getOriginalUrl(req);
+    const sourceIp = req.ip;
 
     if (req.method === 'POST') {
         const user = req.body.username as string;
         const pass = req.body.password as string;
+
+        console.log(`[loginPageHandler] Login attempt for user "${user}" from IP: ${sourceIp}`);
 
         if (user && pass) {
             const hash = users[user];
@@ -101,6 +113,8 @@ const loginPageHandler: RequestHandler = async (req, res) => {
             try {
                 const isMatch = await argon2.verify(hashToVerify, pass);
                 if (isMatch && hash) {
+                    console.log(`[loginPageHandler] SUCCESS: User "${user}" authenticated successfully from IP: ${sourceIp}`);
+
                     const jwt = await new SignJWT({ sub: user })
                         .setProtectedHeader({ alg: 'HS256' })
                         .setIssuer(JWT_ISSUER)
@@ -115,6 +129,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
                 console.error('Internal error during argon2 verification', error);
             }
         }
+        console.warn(`[loginPageHandler] FAILED: Invalid login attempt for user "${user}" from IP: ${sourceIp}`);
     }
 
     try {
@@ -148,6 +163,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
 };
 
 const logoutHandler: RequestHandler = (req, res) => {
+    console.log(`[logoutHandler] User logged out from IP :${req.ip}`);
     res.setHeader('Set-Cookie', cookie.serialize(COOKIE_NAME, '', { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict' }));
 
     const logoutBody = `

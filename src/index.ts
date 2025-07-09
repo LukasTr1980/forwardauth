@@ -144,12 +144,20 @@ const verifyHandler: RequestHandler = async (req, res) => {
 const loginPageHandler: RequestHandler = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
+    const cookies = cookie.parse(req.headers.cookie || '');
+    if (!cookies[CSRF_COOKIE_NAME]) {
+        const csrfToken = randomBytes(32).toString('hex');
+        const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
+        res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
+
+        return res.redirect(req.originalUrl);
+    }
+
     const rawRedirectUri = (req.query.redirect_uri || (req.body && req.body.redirect_uri)) as string;
     const validatedDestinationUri = validateRedirectUri(rawRedirectUri || getOriginalUrl(req));
     const safeDestinationUri = he.encode(validatedDestinationUri);
 
     const sourceIp = req.ip;
-    const cookies = cookie.parse(req.headers.cookie || '');
 
     if (req.method === 'POST') {
         const sentCsrfToken = req.body.csrf_token as string;
@@ -217,7 +225,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         res.status(200).send(getPageHTML('Authenticated', loggedInBody));
         return;
     } catch (error) {
-        const csrfToken = randomBytes(32).toString('hex');
+        const csrfToken = cookies[CSRF_COOKIE_NAME];
         const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
 
         res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
@@ -228,7 +236,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
 
         const loginFormBody = `
             ${loginMessage}
-            <form method="post" action="/auth">
+            <form method="post" action="${AUTH_ORIGIN}/auth">
                 <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
                 <input type="hidden" name="csrf_token" value="${csrfToken}" />
                 <input name="username" placeholder="Username" required autocomplete="username" />

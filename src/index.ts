@@ -34,6 +34,8 @@ const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
 const CSRF_COOKIE_NAME = '__Host-csrf-token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const DOMAIN = process.env.DOMAIN;
+const DOMAIN_WILDCARD = `https://*.${DOMAIN}`;
+const ROOT_DOMAIN = `https://${DOMAIN}`;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3000/auth';
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 
@@ -42,7 +44,7 @@ app.disable('x-powered-by');
 app.use(helmet.contentSecurityPolicy({
     directives: {
         defaultSrc: ["'self'"],
-        formAction: ["'self'", AUTH_ORIGIN],
+        formAction: ["'self'", AUTH_ORIGIN, ROOT_DOMAIN, DOMAIN_WILDCARD],
     }
 }));
 app.set('trust proxy', 1);

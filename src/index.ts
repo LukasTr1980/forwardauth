@@ -35,13 +35,14 @@ const CSRF_COOKIE_NAME = '__Host-csrf-token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const DOMAIN = process.env.DOMAIN;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3000/auth';
+const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 
 const app = express();
 app.disable('x-powered-by');
-app.use(helmet());
 app.use(helmet.contentSecurityPolicy({
     directives: {
         defaultSrc: ["'self'"],
+        formAction: ["'self'", AUTH_ORIGIN],
     }
 }));
 app.set('trust proxy', 1);

@@ -29,7 +29,11 @@ const USER_FILE = process.env.USER_FILE ?? path.resolve(__dirname, '../users.jso
 const PORT = getEnvAsNumber('PORT', 3000);
 const COOKIE_MAX_AGE_S = getEnvAsNumber('COOKIE_MAX_AGE_S', 3600);
 const LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('LOGIN_LIMITER_WINDOW_S', 15 * 60);
+const VERIFY_LIMITER_WINDOW_S = getEnvAsNumber('VERIFY_LIMITER_WINDOW_S', 60);
+const AUTH_PAGE_LIMITER_WINDOW_S = getEnvAsNumber('AUTH_PAGE_LIMITER_WINDOW_S', 15 * 60);
 const LOGIN_LIMITER_MAX = getEnvAsNumber('LOGIN_LIMITER_MAX', 10);
+const VERIFY_LIMITER_MAX = getEnvAsNumber('VERIFY_LIMITER_MAX', 5000);
+const AUTH_PAGE_LIMITER_MAX = getEnvAsNumber('AUTH_PAGE_LIMITER_MAX', 300);
 const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
 const CSRF_COOKIE_NAME = '__Host-csrf-token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
@@ -56,6 +60,20 @@ const loginLimiter = rateLimit({
     legacyHeaders: false,
     message: 'Too many login attempts from this IP, please try again after 15 minutes',
 });
+const verifyLimiter = rateLimit({
+    windowMs: VERIFY_LIMITER_WINDOW_S * 1000,
+    max: VERIFY_LIMITER_MAX,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Too many requests from this IP, please try again later',
+})
+const authPageLimiter = rateLimit({
+    windowMs: AUTH_PAGE_LIMITER_WINDOW_S * 1000,
+    max: AUTH_PAGE_LIMITER_MAX,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Too many requests from this IP, please try again later',
+})
 
 let users: Record<string, User> = {};
 
@@ -152,7 +170,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
         res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
 
-        return res.redirect(req.originalUrl);
+        return res.redirect(validateRedirectUri(req.originalUrl));
     }
 
     const rawRedirectUri = (req.query.redirect_uri || (req.body && req.body.redirect_uri)) as string;
@@ -279,9 +297,9 @@ app.get('/', (req, res) => {
 })
 
 app.post('/auth', loginLimiter, loginPageHandler);
-app.get('/auth', loginPageHandler);
+app.get('/auth', authPageLimiter, loginPageHandler);
 app.get('/logout', logoutHandler);
-app.get('/verify', verifyHandler);
+app.get('/verify', verifyLimiter, verifyHandler);
 
 (async () => {
     await loadUsers();

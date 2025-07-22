@@ -42,6 +42,25 @@ const DOMAIN_WILDCARD = `https://*.${DOMAIN}`;
 const ROOT_DOMAIN = `https://${DOMAIN}`;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3000/auth';
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
+const SHOW_LOGIN_BANNER = process.env.SHOW_LOGIN_BANNER === '1';
+const TOAST_INTERVAL_S = getEnvAsNumber('TOAST_INTERVAL_S', 300);
+const BANNER_COOKIE_PREFIX = '__Host-auth-banner-';
+const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
+
+function acceptsHtml(req: Request): boolean {
+    const accept = req.headers['accept'] || '';
+    return typeof accept === 'string' && accept.includes('text/html');
+}
+
+function isDocumentRequest(req: Request): boolean {
+    const dest = req.headers['sec-fetch-dest'];
+    if (dest === 'document') return true;
+    return acceptsHtml(req);
+}
+
+function bannerCookieNameForHost(host: string) {
+    return `${BANNER_COOKIE_PREFIX}${host.replace(/\./g, '_')}`;
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -74,6 +93,35 @@ const authPageLimiter = rateLimit({
     legacyHeaders: false,
     message: 'Too many requests from this IP, please try again later',
 })
+
+function getToastPageHTML(title: string, toastText: string, redirectTo: string, delayMs = 2200): string {
+    const delaySec = (delayMs / 1000).toFixed(1);
+    const safeTo = he.encode(redirectTo);
+
+    return `
+  <!doctype html>
+  <html lang="de">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${title}</title>
+    <meta http-equiv="refresh" content="${delaySec};url=${safeTo}">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="toast toast--top-center" role="status" aria-live="polite">
+      <span class="toast-icon">✓</span>${toastText}
+    </div>
+    <noscript>
+      <div class="container">
+        <h1>${title}</h1>
+        <p>${toastText}</p>
+        <a href="${safeTo}">Zurück</a>
+      </div>
+    </noscript>
+  </body>
+  </html>`;
+}
 
 let users: Record<string, User> = {};
 
@@ -141,12 +189,42 @@ const verifyHandler: RequestHandler = async (req, res) => {
     console.log(`[verifyHandler] Verifying request from IP: ${sourceIp}`);
 
     try {
-        const cookies = cookie.parse(req.headers.cookie || '');
-        const token = cookies[COOKIE_NAME];
+        const parsedCookies = cookie.parse(req.headers.cookie || '');
+        const token = parsedCookies[COOKIE_NAME];
         if (!token) throw new Error('No token found');
 
-        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+        const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
         console.log(`[verifyHandler] Verification successful for IP: ${sourceIp}`);
+
+        if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
+            res.sendStatus(200);
+            return;
+        }
+
+        if (SHOW_LOGIN_BANNER && req.method === 'GET' && isDocumentRequest(req)) {
+            const host = req.header('X-Forwarded-Host') ?? req.hostname;
+            const bannerCookieName = bannerCookieNameForHost(host);
+
+            if (!parsedCookies[bannerCookieName]) {
+                const originalUrl = getOriginalUrl(req);
+
+                const cookieOpts: cookie.SerializeOptions = {
+                    secure: true,
+                    httpOnly: false,
+                    sameSite: 'lax',
+                    path: '/',
+                    maxAge: TOAST_INTERVAL_S,
+                };
+
+                res.setHeader('Set-Cookie', cookie.serialize(bannerCookieName, '1', cookieOpts));
+
+                const infoUrl = new URL('/still-logged', AUTH_ORIGIN);
+                infoUrl.searchParams.set('to', originalUrl);
+                res.redirect(303, infoUrl.toString());
+                return;
+            }
+        }
+
         res.sendStatus(200);
         return;
     } catch (error) {
@@ -207,6 +285,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
                     const jwt = await new SignJWT({ sub: user })
                         .setProtectedHeader({ alg: 'HS256' })
                         .setIssuer(JWT_ISSUER)
+                        .setIssuedAt()
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
                         .sign(JWT_SECRET);
 
@@ -300,6 +379,19 @@ app.post('/auth', loginLimiter, loginPageHandler);
 app.get('/auth', authPageLimiter, loginPageHandler);
 app.get('/logout', logoutHandler);
 app.get('/verify', verifyLimiter, verifyHandler);
+
+app.get('/still-logged', (req, res) => {
+    const raw = (req.query.to as string) || '/';
+    const dest = validateRedirectUri(raw);
+
+    const html = getToastPageHTML(
+        `Still Logged In in ${DOMAIN}`,
+        `You are still logged in at ${DOMAIN}.`,
+        dest,
+        2200
+    );
+    res.status(200).send(html);
+});
 
 (async () => {
     await loadUsers();

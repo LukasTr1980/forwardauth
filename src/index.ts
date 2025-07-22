@@ -98,29 +98,28 @@ function getToastPageHTML(title: string, toastText: string, redirectTo: string, 
     const safeTo = he.encode(redirectTo);
 
     return `
-    <!doctype html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${title}</title>
-        <meta http-equiv="refresh" content="${delaySec};url=${safeTo}">
-        <link rel="stylesheet" href="/styles.css">
-    </head>
-    <body>
-        <!-- Kein Block-Container mehr -->
-        <div class="toast toast--top-center" role="status" aria-live="polite">
-            <span class="toast-icon">✓</span>${toastText}
-        </div>
-        <noscript>
-            <div class="container">
-                <h1>${title}</h1>
-                <p>${toastText}</p>
-                <a href="${safeTo}">Zurück</a>
-            </div>
-        </noscript>
-    </body>
-    </html>`;
+  <!doctype html>
+  <html lang="de">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${title}</title>
+    <meta http-equiv="refresh" content="${delaySec};url=${safeTo}">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="toast toast--top-center" role="status" aria-live="polite">
+      <span class="toast-icon">✓</span>${toastText}
+    </div>
+    <noscript>
+      <div class="container">
+        <h1>${title}</h1>
+        <p>${toastText}</p>
+        <a href="${safeTo}">Zurück</a>
+      </div>
+    </noscript>
+  </body>
+  </html>`;
 }
 
 let users: Record<string, User> = {};

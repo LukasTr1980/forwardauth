@@ -93,8 +93,10 @@ const authPageLimiter = rateLimit({
     message: 'Too many requests from this IP, please try again later',
 })
 
-function getToastPageHTML(title: string, toastText: string, redirectTo: string, delayMs = 1200): string {
+function getToastPageHTML(title: string, toastText: string, redirectTo: string, delayMs = 2200): string {
     const delaySec = (delayMs / 1000).toFixed(1);
+    const safeTo = he.encode(redirectTo);
+
     return `
     <!doctype html>
     <html lang="en">
@@ -102,16 +104,21 @@ function getToastPageHTML(title: string, toastText: string, redirectTo: string, 
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>${title}</title>
-        <meta http-equiv="refresh" content="${delaySec};url=${he.encode(redirectTo)}">
+        <meta http-equiv="refresh" content="${delaySec};url=${safeTo}">
         <link rel="stylesheet" href="/styles.css">
     </head>
     <body>
-        <div class="container">
-            <h1>Logged In</h1>
-            <p>Redirecting...</p>
-            <noscript><a href="${he.encode(redirectTo)}">Click here, if nothing happens.</a></noscript>
+        <!-- Kein Block-Container mehr -->
+        <div class="toast toast--top-center" role="status" aria-live="polite">
+            <span class="toast-icon">✓</span>${toastText}
         </div>
-        <div class="toast" role="status" aria-live="polite">${toastText}</div>
+        <noscript>
+            <div class="container">
+                <h1>${title}</h1>
+                <p>${toastText}</p>
+                <a href="${safeTo}">Zurück</a>
+            </div>
+        </noscript>
     </body>
     </html>`;
 }
@@ -374,7 +381,8 @@ app.get('/still-logged', (req, res) => {
     const html = getToastPageHTML(
         'Still Logged In',
         'You are still logged in.',
-        dest
+        dest,
+        2200
     );
     res.status(200).send(html);
 });

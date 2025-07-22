@@ -42,6 +42,24 @@ const DOMAIN_WILDCARD = `https://*.${DOMAIN}`;
 const ROOT_DOMAIN = `https://${DOMAIN}`;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3000/auth';
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
+const SHOW_LOGIN_BANNER = process.env.SHOW_LOGIN_BANNER === '1';
+const TOAST_INTERVAL_S = getEnvAsNumber('TOAST_INTERVAL_S', 300);
+const BANNER_COOKIE_PREFIX = '__Host-auth-banner';
+
+function acceptsHtml(req: Request): boolean {
+    const accept = req.headers['accept'] || '';
+    return typeof accept === 'string' && accept.includes('text/html');
+}
+
+function isDocumentRequest(req: Request): boolean {
+    const dest = req.headers['sec-fetch-dest'];
+    if (dest === 'document') return true;
+    return acceptsHtml(req);
+}
+
+function bannerCookieNameForHost(host: string) {
+    return `${BANNER_COOKIE_PREFIX}${host.replace(/\./g, '_')}`;
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -74,6 +92,29 @@ const authPageLimiter = rateLimit({
     legacyHeaders: false,
     message: 'Too many requests from this IP, please try again later',
 })
+
+function getToastPageHTML(title: string, toastText: string, redirectTo: string, delayMs = 1200): string {
+    const delaySec = (delayMs / 1000).toFixed(1);
+    return `
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${title}</title>
+        <meta http-equiv="refresh" content="${delaySec};url=${he.encode(redirectTo)}">
+        <link rel="stylesheet" href="/styles.css">
+    </head>
+    <body>
+        <div class="container">
+            <h1>Logged In</h1>
+            <p>Redirecting...</p>
+            <noscript><a href="${he.encode(redirectTo)}">Click here, if nothing happens.</a></noscript>
+        </div>
+        <div class="toast" role="status" aria-live="polite">${toastText}</div>
+    </body>
+    </html>`;
+}
 
 let users: Record<string, User> = {};
 
@@ -147,6 +188,33 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
         console.log(`[verifyHandler] Verification successful for IP: ${sourceIp}`);
+
+        if (SHOW_LOGIN_BANNER && req.method === 'GET' && isDocumentRequest(req)) {
+            const host = req.header('X-Forwarded-Host') ?? req.hostname;
+            const bannerCookieName = bannerCookieNameForHost(host);
+            const cookies = cookie.parse(req.headers.cookie || '');
+
+            if (!cookies[bannerCookieName]) {
+                const originalUrl = getOriginalUrl(req);
+
+                const cookieOpts: cookie.SerializeOptions = {
+                    secure: true,
+                    httpOnly: false,
+                    sameSite: 'lax',
+                    path: '/',
+                    maxAge: TOAST_INTERVAL_S,
+                };
+                if (DOMAIN) cookieOpts.domain = DOMAIN;
+
+                res.setHeader('Set-Cookie', cookie.serialize(bannerCookieName, '1', cookieOpts));
+
+                const infoUrl = new URL('/still-logged', AUTH_ORIGIN);
+                infoUrl.searchParams.set('to', originalUrl);
+                res.redirect(303, infoUrl.toString());
+                return;
+            }
+        }
+
         res.sendStatus(200);
         return;
     } catch (error) {
@@ -300,6 +368,19 @@ app.post('/auth', loginLimiter, loginPageHandler);
 app.get('/auth', authPageLimiter, loginPageHandler);
 app.get('/logout', logoutHandler);
 app.get('/verify', verifyLimiter, verifyHandler);
+
+app.get('/still-logged', (req, res) => {
+    const raw = (req.query.to as string) || '/';
+    const dest = validateRedirectUri(raw);
+
+    const html = getToastPageHTML(
+        'Still Logged In',
+        'You are still logged in.',
+        dest
+    );
+
+    res.status(200).send(html);
+})
 
 (async () => {
     await loadUsers();

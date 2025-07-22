@@ -45,6 +45,7 @@ const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const SHOW_LOGIN_BANNER = process.env.SHOW_LOGIN_BANNER === '1';
 const TOAST_INTERVAL_S = getEnvAsNumber('TOAST_INTERVAL_S', 300);
 const BANNER_COOKIE_PREFIX = '__Host-auth-banner-';
+const JUST_LOGGED_COOKIE = '__Host-just-logged';
 
 function acceptsHtml(req: Request): boolean {
     const accept = req.headers['accept'] || '';
@@ -195,6 +196,18 @@ const verifyHandler: RequestHandler = async (req, res) => {
         await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
         console.log(`[verifyHandler] Verification successful for IP: ${sourceIp}`);
 
+        if (parsedCookies[JUST_LOGGED_COOKIE]) {
+            res.setHeader('Set-Cookie', cookie.serialize(JUST_LOGGED_COOKIE, '', {
+                secure: true,
+                httpOnly: false,
+                sameSite: 'lax',
+                path: '/',
+                maxAge: 0
+            }));
+            res.sendStatus(200);
+            return;
+        }
+
         if (SHOW_LOGIN_BANNER && req.method === 'GET' && isDocumentRequest(req)) {
             const host = req.header('X-Forwarded-Host') ?? req.hostname;
             const bannerCookieName = bannerCookieNameForHost(host);
@@ -289,7 +302,14 @@ const loginPageHandler: RequestHandler = async (req, res) => {
 
                     res.setHeader('Set-Cookie', [
                         cookie.serialize(COOKIE_NAME, jwt, sessionCookieOptions),
-                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...csrfCookieOptions, maxAge: 0 })
+                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...csrfCookieOptions, maxAge: 0 }),
+                        cookie.serialize(JUST_LOGGED_COOKIE, '1', {
+                            secure: true,
+                            httpOnly: false,
+                            sameSite: 'lax',
+                            path: '/',
+                            maxAge: 10
+                        })
                     ]);
 
                     res.redirect(validatedDestinationUri);
@@ -378,8 +398,8 @@ app.get('/still-logged', (req, res) => {
     const dest = validateRedirectUri(raw);
 
     const html = getToastPageHTML(
-        'Still Logged In',
-        'You are still logged in.',
+        `Still Logged In in ${DOMAIN}`,
+        `You are still logged in at ${DOMAIN}.`,
         dest,
         2200
     );

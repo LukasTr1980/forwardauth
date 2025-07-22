@@ -45,7 +45,7 @@ const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const SHOW_LOGIN_BANNER = process.env.SHOW_LOGIN_BANNER === '1';
 const TOAST_INTERVAL_S = getEnvAsNumber('TOAST_INTERVAL_S', 300);
 const BANNER_COOKIE_PREFIX = '__Host-auth-banner-';
-const JUST_LOGGED_COOKIE = '__Host-just-logged';
+const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 
 function acceptsHtml(req: Request): boolean {
     const accept = req.headers['accept'] || '';
@@ -193,17 +193,10 @@ const verifyHandler: RequestHandler = async (req, res) => {
         const token = parsedCookies[COOKIE_NAME];
         if (!token) throw new Error('No token found');
 
-        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+        const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
         console.log(`[verifyHandler] Verification successful for IP: ${sourceIp}`);
 
-        if (parsedCookies[JUST_LOGGED_COOKIE]) {
-            res.setHeader('Set-Cookie', cookie.serialize(JUST_LOGGED_COOKIE, '', {
-                secure: true,
-                httpOnly: false,
-                sameSite: 'lax',
-                path: '/',
-                maxAge: 0
-            }));
+        if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
             res.sendStatus(200);
             return;
         }
@@ -292,6 +285,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
                     const jwt = await new SignJWT({ sub: user })
                         .setProtectedHeader({ alg: 'HS256' })
                         .setIssuer(JWT_ISSUER)
+                        .setIssuedAt()
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
                         .sign(JWT_SECRET);
 
@@ -302,14 +296,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
 
                     res.setHeader('Set-Cookie', [
                         cookie.serialize(COOKIE_NAME, jwt, sessionCookieOptions),
-                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...csrfCookieOptions, maxAge: 0 }),
-                        cookie.serialize(JUST_LOGGED_COOKIE, '1', {
-                            secure: true,
-                            httpOnly: false,
-                            sameSite: 'lax',
-                            path: '/',
-                            maxAge: 10
-                        })
+                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...csrfCookieOptions, maxAge: 0 })
                     ]);
 
                     res.redirect(validatedDestinationUri);

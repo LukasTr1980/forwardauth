@@ -44,7 +44,7 @@ const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const SHOW_LOGIN_BANNER = process.env.SHOW_LOGIN_BANNER === '1';
 const TOAST_INTERVAL_S = getEnvAsNumber('TOAST_INTERVAL_S', 300);
-const BANNER_COOKIE_PREFIX = '__Host-auth-banner';
+const BANNER_COOKIE_PREFIX = '__Host-auth-banner-';
 
 function acceptsHtml(req: Request): boolean {
     const accept = req.headers['accept'] || '';
@@ -182,8 +182,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
     console.log(`[verifyHandler] Verifying request from IP: ${sourceIp}`);
 
     try {
-        const cookies = cookie.parse(req.headers.cookie || '');
-        const token = cookies[COOKIE_NAME];
+        const parsedCookies = cookie.parse(req.headers.cookie || '');
+        const token = parsedCookies[COOKIE_NAME];
         if (!token) throw new Error('No token found');
 
         await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
@@ -192,9 +192,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
         if (SHOW_LOGIN_BANNER && req.method === 'GET' && isDocumentRequest(req)) {
             const host = req.header('X-Forwarded-Host') ?? req.hostname;
             const bannerCookieName = bannerCookieNameForHost(host);
-            const cookies = cookie.parse(req.headers.cookie || '');
 
-            if (!cookies[bannerCookieName]) {
+            if (!parsedCookies[bannerCookieName]) {
                 const originalUrl = getOriginalUrl(req);
 
                 const cookieOpts: cookie.SerializeOptions = {
@@ -204,7 +203,6 @@ const verifyHandler: RequestHandler = async (req, res) => {
                     path: '/',
                     maxAge: TOAST_INTERVAL_S,
                 };
-                if (DOMAIN) cookieOpts.domain = DOMAIN;
 
                 res.setHeader('Set-Cookie', cookie.serialize(bannerCookieName, '1', cookieOpts));
 
@@ -378,9 +376,8 @@ app.get('/still-logged', (req, res) => {
         'You are still logged in.',
         dest
     );
-
     res.status(200).send(html);
-})
+});
 
 (async () => {
     await loadUsers();

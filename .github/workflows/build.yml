@@ -1,0 +1,77 @@
+name: Build & Push forwardauth Image
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: forwardauth-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+
+      - id: pkg
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+
+
+      - name: Validate tag vs package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="${{ steps.pkg.outputs.version }}"
+          if [[ "$TAG" != "$PKG" ]]; then
+            echo "::error::Tag v$TAG != package.json $PKG"
+            exit 1
+          fi
+          echo "Version: $PKG"
+
+      - name: Login to registry
+        env:
+          REGISTRY: registry.charts.cx
+        run: |
+          echo "${{ secrets.REGISTRY_PASS }}" \
+          | docker login "$REGISTRY" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
+
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: registry.charts.cx/forwardauth:${{ steps.pkg.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Image Digest" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"

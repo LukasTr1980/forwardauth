@@ -1,5 +1,6 @@
 {
   "name": "forwardauth",
+  "private": true,
   "version": "2.0.4",
   "description": "",
   "homepage": "https://github.com/LukasTr1980/forwardauth#readme",
@@ -18,7 +19,10 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "generate-hash": "tsx src/generate-hash.ts"
+    "generate-hash": "tsx src/generate-hash.ts",
+    "rel:patch": "npm version patch --no-git-tag-version",
+    "rel:minor": "npm version minor --no-git-tag-version",
+    "rel:major": "npm version major --no-git-tag-version"
   },
   "dependencies": {
     "argon2": "^0.43.0",

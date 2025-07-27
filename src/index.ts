@@ -281,9 +281,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
         res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
 
-        // Safe: validateRedirectUri() limited to own Domain/Sub-Paths
-        // codeql[js/server-side-unvalidated-url-redirection] false positive
-        return res.redirect(validateRedirectUri(req.originalUrl));
+        return res.redirect(validateRedirectUri(req.originalUrl)); // codeql[js/server-side-unvalidated-url-redirection]
     }
 
     const rawRedirectUri = req.query.redirect_uri ?? req.body?.redirect_uri;

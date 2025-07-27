@@ -23,7 +23,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .eslintcache
-          key: eslint-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: eslint-${{ runner.os }}-${{ hashFiles('package-lock.json', 'eslint.config.*') }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -45,4 +45,4 @@ jobs:
         if: steps.eslint-cache.outputs.cache-hit != 'true'
         with:
           path: .eslintcache
-          key: eslint-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: eslint-${{ runner.os }}-${{ hashFiles('package-lock.json', 'eslint.config.*') }}

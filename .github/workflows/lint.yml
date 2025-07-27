@@ -19,6 +19,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - id: eslint-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .eslintcache
+          key: eslint-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -33,3 +39,10 @@ jobs:
           REPORT=$(npx eslint . -f json --max-warnings=0 --cache)
           COUNT=$(echo "$REPORT" | jq 'length')
           echo "::notice::ESLint OK - $COUNT files checked"
+
+      - name: Save ESLint cache
+        uses: actions/cache/save@v4
+        if: steps.eslint-cache.outputs.cache-hit != 'true'
+        with:
+          path: .eslintcache
+          key: eslint-${{ runner.os }}-${{ hashFiles('package-lock.json') }}

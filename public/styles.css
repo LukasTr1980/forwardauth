@@ -85,7 +85,7 @@ p {
     opacity: 0;
     transform: translate(var(--x), var(--y-start)) scale(.97);
     animation: toast-in .22s ease-out forwards,
-               toast-out .26s ease-in forwards 2.4s;
+        toast-out .26s ease-in forwards 2.4s;
 }
 
 .toast--top-center{

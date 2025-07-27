@@ -1,4 +1,5 @@
-import express, { Request, RequestHandler } from 'express';
+import express, { type Request, type RequestHandler } from 'express';
+import { type ParamsDictionary } from 'express-serve-static-core';
 import rateLimit from 'express-rate-limit';
 import * as cookie from 'cookie';
 import { SignJWT, jwtVerify } from 'jose';
@@ -11,6 +12,17 @@ import { randomBytes } from 'crypto';
 
 interface User {
     hash: string;
+}
+
+interface LoginQuery {
+    redirect_uri?: string;
+}
+
+interface LoginBody {
+    username?: string;
+    password?: string;
+    csrf_token?: string;
+    redirect_uri?: string;
 }
 
 function getEnvAsNumber(key: string, defaultValue: number): number {
@@ -40,7 +52,7 @@ const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const DOMAIN = process.env.DOMAIN;
 const DOMAIN_WILDCARD = `https://*.${DOMAIN}`;
 const ROOT_DOMAIN = `https://${DOMAIN}`;
-const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL || 'http://localhost:3000/auth';
+const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3000/auth';
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const SHOW_LOGIN_BANNER = process.env.SHOW_LOGIN_BANNER === '1';
 const TOAST_INTERVAL_S = getEnvAsNumber('TOAST_INTERVAL_S', 300);
@@ -48,7 +60,7 @@ const BANNER_COOKIE_PREFIX = '__Host-auth-banner-';
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 
 function acceptsHtml(req: Request): boolean {
-    const accept = req.headers['accept'] || '';
+    const accept = req.headers.accept ?? '';
     return typeof accept === 'string' && accept.includes('text/html');
 }
 
@@ -128,9 +140,25 @@ function getToastPageHTML(title: string, toastText: string, redirectTo: string, 
 
 let users: Record<string, User> = {};
 
+function isRecordOfUser(data: unknown): data is Record<string, User> {
+    return (
+        typeof data === 'object' &&
+        data !== null &&
+        Object.values(data).every(
+            (u) => typeof (u as User).hash === 'string'
+        )
+    );
+}
+
 async function loadUsers() {
     try {
-        users = JSON.parse(await fs.readFile(USER_FILE, 'utf-8'));
+        const raw: unknown = JSON.parse(await fs.readFile(USER_FILE, 'utf-8'));
+
+        if (!isRecordOfUser(raw)) {
+            throw new Error('Invalid users.json structure');
+        }
+
+        users = raw;
         console.log(`Successfully loaded ${Object.keys(users).length} users from ${USER_FILE}`);
     } catch (error) {
         console.error(`FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
@@ -154,7 +182,7 @@ function validateRedirectUri(uri: string): string {
         if (uri.startsWith('/') && !uri.startsWith('//')) {
             return uri;
         }
-        console.warn(`[validateRedirectUri] Invalid redirect URI provided: ${uri}`);
+        console.warn(`[validateRedirectUri] Invalid redirect URI provided: ${uri}`, error);
         return defaultRedirect;
     }
 }
@@ -194,7 +222,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
     console.log(`[verifyHandler] Verifying request from IP: ${sourceIp}`);
 
     try {
-        const parsedCookies = cookie.parse(req.headers.cookie || '');
+        const parsedCookies = cookie.parse(req.headers.cookie ?? '');
         const token = parsedCookies[COOKIE_NAME];
         if (!token) throw new Error('No token found');
 
@@ -244,10 +272,10 @@ const verifyHandler: RequestHandler = async (req, res) => {
     }
 };
 
-const loginPageHandler: RequestHandler = async (req, res) => {
+const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>, string, LoginBody, LoginQuery> = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
-    const cookies = cookie.parse(req.headers.cookie || '');
+    const cookies = cookie.parse(req.headers.cookie ?? '');
     if (!cookies[CSRF_COOKIE_NAME]) {
         const csrfToken = randomBytes(32).toString('hex');
         const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
@@ -256,14 +284,14 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         return res.redirect(validateRedirectUri(req.originalUrl));
     }
 
-    const rawRedirectUri = (req.query.redirect_uri || (req.body && req.body.redirect_uri)) as string;
-    const validatedDestinationUri = validateRedirectUri(rawRedirectUri || getOriginalUrl(req));
+    const rawRedirectUri = req.query.redirect_uri ?? req.body?.redirect_uri;
+    const validatedDestinationUri = validateRedirectUri(rawRedirectUri ?? getOriginalUrl(req as Request));
     const safeDestinationUri = he.encode(validatedDestinationUri);
 
     const sourceIp = req.ip;
 
     if (req.method === 'POST') {
-        const sentCsrfToken = req.body.csrf_token as string;
+        const sentCsrfToken = req.body.csrf_token!;
         const cookieCsrfToken = cookies[CSRF_COOKIE_NAME];
 
         if (!sentCsrfToken || !cookieCsrfToken || sentCsrfToken !== cookieCsrfToken) {
@@ -272,8 +300,8 @@ const loginPageHandler: RequestHandler = async (req, res) => {
             return;
         }
 
-        const user = req.body.username as string;
-        const pass = req.body.password as string;
+        const user = req.body.username!;
+        const pass = req.body.password!;
         console.log(`[loginPageHandler] Login attempt for user "${user}" from IP: ${sourceIp}`);
 
         if (user && pass) {
@@ -329,6 +357,7 @@ const loginPageHandler: RequestHandler = async (req, res) => {
         res.status(200).send(getPageHTML('Authenticated', loggedInBody));
         return;
     } catch (error) {
+        console.error('[loginPageHandler] JWT verify failed:', error);
         const csrfToken = cookies[CSRF_COOKIE_NAME];
         const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
 
@@ -398,7 +427,7 @@ app.get('/still-logged', (req, res) => {
     res.status(200).send(html);
 });
 
-(async () => {
+void (async () => {
     await loadUsers();
 
     app.listen(PORT, () => {

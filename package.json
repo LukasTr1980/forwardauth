@@ -13,12 +13,13 @@
   },
   "license": "ISC",
   "author": "",
-  "type": "commonjs",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "test": "echo \"no tests yet\"",
+    "lint": "eslint . --ext .ts,.tsx,.js",
     "generate-hash": "tsx src/generate-hash.ts",
     "rel:patch": "npm version patch --no-git-tag-version",
     "rel:minor": "npm version minor --no-git-tag-version",
@@ -36,7 +37,10 @@
     "typescript": "^5.8.3"
   },
   "devDependencies": {
+    "@eslint/js": "^9.32.0",
     "@types/express": "^5.0.3",
-    "@types/he": "^1.2.3"
+    "@types/he": "^1.2.3",
+    "eslint": "^9.32.0",
+    "typescript-eslint": "^8.38.0"
   }
 }

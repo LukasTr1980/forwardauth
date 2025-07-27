@@ -26,4 +26,4 @@ async function generateHash() {
     }
 }
 
-generateHash();
+await generateHash();

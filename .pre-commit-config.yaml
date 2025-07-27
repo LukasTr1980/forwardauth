@@ -6,3 +6,13 @@ repos:
         name: Gitleaks staged scan
         entry: gitleaks protect --staged --no-banner --redact 1>&2
         stages: [pre-commit, pre-push]
+
+  - repo: local
+    hooks:
+      - id: eslint
+        name: ESLint (type-checked TS/JS)
+        entry: npx eslint --max-warnings=0
+        files: \.(ts|tsx|js|jsx)$
+        language: node
+        pass_filenames: true
+        stages: [pre-commit]

@@ -182,7 +182,7 @@ function validateRedirectUri(uri: string): string {
         if (uri.startsWith('/') && !uri.startsWith('//')) {
             return uri;
         }
-        console.warn(`[validateRedirectUri] Invalid redirect URI provided: ${uri}`, error);
+        console.warn('[validateRedirectUri] Invalid redirect URI provided: %s', uri, error);
         return defaultRedirect;
     }
 }
@@ -281,6 +281,8 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
         res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
 
+        // Safe: validateRedirectUri() limited to own Domain/Sub-Paths
+        // codeql[js/server-side-unvalidated-url-redirection] false positive
         return res.redirect(validateRedirectUri(req.originalUrl));
     }
 

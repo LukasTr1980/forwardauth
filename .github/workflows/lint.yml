@@ -29,8 +29,7 @@ jobs:
 
       - name: Run ESLint
         id: lint
-        run: | 
-          npx eslint . --max-warnings=0 --format json --output-file eslint-report.json
-          jq '. | length' eslint-report.json | \
-            awk '{print "::notice::Checked " $1 " files with ESLint"}'
-          
+        run: |
+          REPORT=$(npx eslint . -f json --max-warnings=0 --cache)
+          COUNT=$(echo "$REPORT" | jq 'length')
+          echo "::notice::ESLint OK - $COUNT files checked"

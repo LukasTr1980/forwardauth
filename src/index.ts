@@ -105,6 +105,9 @@ function getToastPageHTML(title: string, toastText: string, redirectTo: string, 
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${title}</title>
+    <link rel="icon" href="/favicon.ico" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
     <meta http-equiv="refresh" content="${delaySec};url=${safeTo}">
     <link rel="stylesheet" href="/styles.css">
   </head>
@@ -170,7 +173,9 @@ const getPageHTML = (title: string, body: string): string => `
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>${title}</title>
-        <!-- Verlinke zur externen CSS-Datei -->
+        <link rel="icon" href="/favicon.ico" />
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
         <link rel="stylesheet" href="/styles.css">
     </head>
     <body>

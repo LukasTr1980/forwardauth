@@ -28,4 +28,9 @@ jobs:
       - run: npm ci
 
       - name: Run ESLint
-        run: npm run lint -- --max-warnings=0 --cache
+        id: lint
+        run: | 
+          npx eslint . --max-warnings=0 --format json --output-file eslint-report.json
+          jq '. | length' eslint-report.json | \
+            awk '{print "::notice::Checked " $1 " files with ESLint"}'
+          

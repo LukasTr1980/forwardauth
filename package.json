@@ -19,7 +19,7 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "test": "echo \"no tests yet\"",
-    "lint": "eslint .",
+    "lint": "eslint . --cache",
     "generate-hash": "tsx src/generate-hash.ts",
     "rel:patch": "npm version patch --no-git-tag-version",
     "rel:minor": "npm version minor --no-git-tag-version",

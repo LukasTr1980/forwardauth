@@ -266,9 +266,13 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         const originalUrl = getOriginalUrl(req);
 
-        const loginUrl = new URL(LOGIN_REDIRECT_URL, `${req.protocol}://${req.get('host')}`);
+        const loginUrl = new URL(LOGIN_REDIRECT_URL);
         loginUrl.searchParams.set('redirect_uri', originalUrl);
-        res.redirect(loginUrl.toString());
+        if (isDocumentRequest(req)) {
+            res.redirect(loginUrl.toString());
+        } else {
+            res.status(401).set('Cache-Control', 'no-store').end('Unauthorized');
+        }
     }
 };
 

@@ -1,7 +1,7 @@
 {
   "name": "forwardauth",
   "private": true,
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "",
   "homepage": "https://github.com/LukasTr1980/forwardauth#readme",
   "bugs": {
@@ -26,10 +26,10 @@
     "rel:major": "npm version major --no-git-tag-version"
   },
   "dependencies": {
-    "argon2": "^0.43.0",
+    "argon2": "^0.44.0",
     "cookie": "^1.0.2",
     "express": "^5.1.0",
-    "express-rate-limit": "^7.5.1",
+    "express-rate-limit": "^8.1.0",
     "he": "^1.2.0",
     "helmet": "^8.1.0",
     "jose": "^6.0.11",

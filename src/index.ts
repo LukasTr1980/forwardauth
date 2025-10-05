@@ -81,21 +81,21 @@ app.set('trust proxy', 1);
 
 const loginLimiter = rateLimit({
     windowMs: LOGIN_LIMITER_WINDOW_S * 1000,
-    max: LOGIN_LIMITER_MAX,
+    limit: LOGIN_LIMITER_MAX,
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many login attempts from this IP, please try again after 15 minutes',
 });
 const verifyLimiter = rateLimit({
     windowMs: VERIFY_LIMITER_WINDOW_S * 1000,
-    max: VERIFY_LIMITER_MAX,
+    limit: VERIFY_LIMITER_MAX,
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many requests from this IP, please try again later',
 })
 const authPageLimiter = rateLimit({
     windowMs: AUTH_PAGE_LIMITER_WINDOW_S * 1000,
-    max: AUTH_PAGE_LIMITER_MAX,
+    limit: AUTH_PAGE_LIMITER_MAX,
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many requests from this IP, please try again later',

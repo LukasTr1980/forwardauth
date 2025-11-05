@@ -12,6 +12,7 @@ import { randomBytes } from 'crypto';
 
 interface User {
     hash: string;
+    allowedHosts?: string[];
 }
 
 interface LoginQuery {
@@ -105,14 +106,49 @@ const authPageLimiter = rateLimit({
 
 let users: Record<string, User> = {};
 
+function isStringArray(value: unknown): value is string[] {
+    return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
 function isRecordOfUser(data: unknown): data is Record<string, User> {
     return (
         typeof data === 'object' &&
         data !== null &&
         Object.values(data).every(
-            (u) => typeof (u as User).hash === 'string'
+            (u) => typeof (u as User).hash === 'string' &&
+                (
+                    (u as User).allowedHosts === undefined ||
+                    isStringArray((u as User).allowedHosts)
+                )
         )
     );
+}
+
+function normalizeHost(host: string): string {
+    return host.split(':')[0]?.toLowerCase() ?? '';
+}
+
+function isHostAllowed(host: string, allowedHosts?: string[]): boolean {
+    if (!allowedHosts || allowedHosts.length === 0) {
+        return true;
+    }
+
+    const normalizedHost = normalizeHost(host);
+
+    return allowedHosts.some((allowedHost) => {
+        const normalizedAllowed = normalizeHost(allowedHost.trim());
+        if (!normalizedAllowed) return false;
+
+        if (normalizedAllowed.startsWith('*.')) {
+            const suffix = normalizedAllowed.slice(1);
+            return (
+                normalizedHost.endsWith(suffix) &&
+                normalizedHost.length > suffix.length
+            );
+        }
+
+        return normalizedHost === normalizedAllowed;
+    });
 }
 
 async function loadUsers() {
@@ -189,7 +225,28 @@ const verifyHandler: RequestHandler = async (req, res) => {
         if (!token) throw new Error('No token found');
 
         const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
-        console.log(`[verifyHandler] Verification successful for IP: ${sourceIp}`);
+
+        if (typeof payload.sub !== 'string') {
+            throw new Error('Token subject missing');
+        }
+
+        const userRecord = users[payload.sub];
+        if (!userRecord) {
+            throw new Error('User not found');
+        }
+
+        const requestedHost = req.header('X-Forwarded-Host') ?? req.hostname;
+        if (!requestedHost) {
+            throw new Error('Host header missing');
+        }
+
+        if (!isHostAllowed(requestedHost, userRecord.allowedHosts)) {
+            console.warn(`[verifyHandler] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
+            res.status(403).set('Cache-Control', 'no-store').end('Forbidden');
+            return;
+        }
+
+        console.log(`[verifyHandler] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
 
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
             res.sendStatus(200);

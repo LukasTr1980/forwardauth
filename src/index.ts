@@ -38,7 +38,8 @@ if (!secretEnv) {
 }
 
 const JWT_SECRET = new TextEncoder().encode(secretEnv);
-const USER_FILE = process.env.USER_FILE ?? path.resolve(__dirname, '../users.json');
+// Resolve users.json relative to the working directory (ESM-safe and robust across tsx/tsc/Docker)
+const USER_FILE = process.env.USER_FILE ?? path.resolve(process.cwd(), 'users.json');
 const PORT = getEnvAsNumber('PORT', 3000);
 const COOKIE_MAX_AGE_S = getEnvAsNumber('COOKIE_MAX_AGE_S', 3600);
 const LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('LOGIN_LIMITER_WINDOW_S', 15 * 60);
@@ -51,8 +52,8 @@ const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
 const CSRF_COOKIE_NAME = '__Host-csrf-token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const DOMAIN = process.env.DOMAIN;
-const DOMAIN_WILDCARD = `https://*.${DOMAIN}`;
-const ROOT_DOMAIN = `https://${DOMAIN}`;
+const DOMAIN_WILDCARD = DOMAIN ? `https://*.${DOMAIN}` : undefined;
+const ROOT_DOMAIN = DOMAIN ? `https://${DOMAIN}` : undefined;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3000/auth';
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
@@ -72,12 +73,19 @@ function isDocumentRequest(req: Request): boolean {
 
 const app = express();
 app.disable('x-powered-by');
+// Build CSP with optional DOMAIN entries only when defined
+const formActionSources = ["'self'", AUTH_ORIGIN, ROOT_DOMAIN, DOMAIN_WILDCARD].filter(Boolean) as string[];
 app.use(helmet.contentSecurityPolicy({
     directives: {
         defaultSrc: ["'self'"],
-        formAction: ["'self'", AUTH_ORIGIN, ROOT_DOMAIN, DOMAIN_WILDCARD],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        frameAncestors: ["'none'"],
+        formAction: formActionSources,
     }
 }));
+// Enable HSTS in TLS-enabled deployments; harmless if behind TLS-terminating proxy
+app.use(helmet.hsts({ maxAge: 15552000, includeSubDomains: true }));
 app.set('trust proxy', 1);
 
 const loginLimiter = rateLimit({
@@ -323,14 +331,15 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                 if (isMatch && hash) {
                     console.log(`[loginPageHandler] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
 
-                    const jwt = await new SignJWT({ sub: user })
+                    const jwt = await new SignJWT({})
                         .setProtectedHeader({ alg: 'HS256' })
                         .setIssuer(JWT_ISSUER)
+                        .setSubject(user)
                         .setIssuedAt()
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
                         .sign(JWT_SECRET);
 
-                    const sessionCookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'strict' };
+                    const sessionCookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'strict', path: '/' };
                     if (DOMAIN) sessionCookieOptions.domain = DOMAIN;
 
                     const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
@@ -364,8 +373,8 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         `;
         res.status(200).send(getPageHTML('Authenticated', loggedInBody));
         return;
-    } catch (error) {
-        console.error('[loginPageHandler] JWT verify failed:', error);
+    } catch {
+        console.warn('[loginPageHandler] JWT verification not present/failed (likely not logged in).');
         const csrfToken = cookies[CSRF_COOKIE_NAME];
         const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
 
@@ -395,7 +404,7 @@ const logoutHandler: RequestHandler = (req, res) => {
 
     console.log(`[logoutHandler] User logged out from IP :${req.ip}`);
 
-    const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict' };
+    const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
     if (!DOMAIN) delete sessionCookieOptions.domain;
 
     const csrfCookieOptions: cookie.SerializeOptions = { maxAge: 0, secure: true, httpOnly: true, sameSite: 'strict', path: '/' };

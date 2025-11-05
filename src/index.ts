@@ -129,8 +129,12 @@ function normalizeHost(host: string): string {
 }
 
 function isHostAllowed(host: string, allowedHosts?: string[]): boolean {
-    if (!allowedHosts || allowedHosts.length === 0) {
+    if (!allowedHosts) {
         return true;
+    }
+
+    if (allowedHosts.length === 0) {
+        return false;
     }
 
     const normalizedHost = normalizeHost(host);

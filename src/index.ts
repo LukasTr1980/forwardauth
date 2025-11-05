@@ -5,6 +5,7 @@ import * as cookie from 'cookie';
 import { SignJWT, jwtVerify } from 'jose';
 import argon2 from 'argon2';
 import fs from 'fs/promises';
+import { watchFile } from 'node:fs';
 import path from 'path';
 import helmet from 'helmet';
 import he from 'he';
@@ -57,6 +58,7 @@ const ROOT_DOMAIN = DOMAIN ? `https://${DOMAIN}` : undefined;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3000/auth';
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
+const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 
 function acceptsHtml(req: Request): boolean {
     const accept = req.headers.accept ?? '';
@@ -166,19 +168,25 @@ function isHostAllowed(host: string, allowedHosts?: string[]): boolean {
     });
 }
 
-async function loadUsers() {
+async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
+    const { fatal = true } = options;
     try {
-        const raw: unknown = JSON.parse(await fs.readFile(USER_FILE, 'utf-8'));
+        const rawContent = await fs.readFile(USER_FILE, 'utf-8');
+        const raw: unknown = JSON.parse(rawContent);
 
         if (!isRecordOfUser(raw)) {
             throw new Error('Invalid users.json structure');
         }
 
         users = raw;
-        console.log(`Successfully loaded ${Object.keys(users).length} users from ${USER_FILE}`);
+        console.log(`Loaded ${Object.keys(users).length} users from ${USER_FILE}`);
     } catch (error) {
-        console.error(`FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
-        process.exit(1);
+        if (fatal) {
+            console.error(`FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
+            process.exit(1);
+        } else {
+            console.warn(`WARN: Reloading users failed; keeping previous users. (${(error as Error).message})`);
+        }
     }
 }
 
@@ -264,12 +272,14 @@ const verifyHandler: RequestHandler = async (req, res) => {
         console.log(`[verifyHandler] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
 
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
+            res.set('X-Forwarded-User', payload.sub);
             res.sendStatus(200);
             return;
         }
 
         // Removed banner redirect logic to prevent redirect loops
 
+        res.set('X-Forwarded-User', payload.sub);
         res.sendStatus(200);
         return;
     } catch (error) {
@@ -435,6 +445,23 @@ app.get('/verify', verifyLimiter, verifyHandler);
 
 void (async () => {
     await loadUsers();
+
+    try {
+        // Poll for changes in users.json and reload on modifications
+        watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
+            if (curr.mtimeMs !== prev.mtimeMs) {
+                console.log(`[users.json] Change detected (mtime). Reloading users from ${USER_FILE}...`);
+                void loadUsers({ fatal: false });
+            }
+        });
+
+        process.on('SIGHUP', () => {
+            console.log('[users.json] SIGHUP received. Reloading users...');
+            void loadUsers({ fatal: false });
+        });
+    } catch (error) {
+        console.warn('[users.json] Failed to initialize watch/polling for users file.', error);
+    }
 
     app.listen(PORT, () => {
         console.log(`ForwardAuth-Server running on port: ${PORT}`);

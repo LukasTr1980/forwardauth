@@ -125,7 +125,10 @@ function isRecordOfUser(data: unknown): data is Record<string, User> {
 }
 
 function normalizeHost(host: string): string {
-    return host.split(':')[0]?.toLowerCase() ?? '';
+    const primaryHost = host.split(',')[0] ?? '';
+    const withoutPort = primaryHost.split(':')[0] ?? '';
+    const trimmed = withoutPort.trim().replace(/\.$/, '');
+    return trimmed.toLowerCase();
 }
 
 function isHostAllowed(host: string, allowedHosts?: string[]): boolean {
@@ -140,7 +143,7 @@ function isHostAllowed(host: string, allowedHosts?: string[]): boolean {
     const normalizedHost = normalizeHost(host);
 
     return allowedHosts.some((allowedHost) => {
-        const normalizedAllowed = normalizeHost(allowedHost.trim());
+        const normalizedAllowed = normalizeHost(allowedHost);
         if (!normalizedAllowed) return false;
 
         if (normalizedAllowed.startsWith('*.')) {

@@ -1,7 +1,7 @@
 import express, { type Request, type RequestHandler } from 'express';
 import { type ParamsDictionary } from 'express-serve-static-core';
 import rateLimit, { type Store as RateLimitStore } from 'express-rate-limit';
-import { RedisStore } from 'rate-limit-redis';
+import { RedisStore, type RedisReply } from 'rate-limit-redis';
 import { createClient, type RedisClientType } from 'redis';
 import * as cookie from 'cookie';
 import { SignJWT, jwtVerify } from 'jose';
@@ -91,16 +91,14 @@ let authPageStore: RateLimitStore | undefined;
 
 if (USE_REDIS_RATE_LIMIT) {
     if (REDIS_URL) {
-        redisClient = createClient({ url: REDIS_URL });
-    } else {
-        redisClient = createClient({
-            socket: { host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
-            username: REDIS_USERNAME,
-            password: REDIS_PASSWORD,
-        });
+        redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD });
+    } else if (REDIS_HOST) {
+        const proto = REDIS_TLS ? 'rediss' : 'redis';
+        const url = `${proto}://${REDIS_HOST}:${REDIS_PORT}`;
+        redisClient = createClient({ url, username: REDIS_USERNAME, password: REDIS_PASSWORD });
     }
 
-    const sendCommand = (...args: string[]) => redisClient!.sendCommand(args);
+    const sendCommand = (...args: string[]): Promise<RedisReply> => redisClient!.sendCommand(args) as unknown as Promise<RedisReply>;
     loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
     verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
     authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });

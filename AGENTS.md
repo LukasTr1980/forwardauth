@@ -30,6 +30,11 @@
 - PRs: Include summary, rationale, and testing notes (env vars used, manual steps). Link issues where relevant. Screenshots only if UI output changed.
 - CI/Lint must pass before merge.
 
+### Agent Commit Policy
+- The Codex agent must never commit, push, or rewrite history autonomously.
+- Only commit or push when explicitly instructed by the user (e.g., "commit", "push").
+- No force-push or history rewrites unless the user requests it explicitly.
+
 ## Security & Configuration
 - Required env: `JWT_SECRET` (must be set); recommended: `DOMAIN`, optional: `COOKIE_NAME`, `USER_FILE`, rate‑limit windows and maxima.
 - Never commit secrets. `gitleaks` runs via pre‑commit and CI; fix or mark intentional.

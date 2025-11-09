@@ -11,7 +11,7 @@ import { watchFile, readFileSync } from 'node:fs';
 import path from 'path';
 import helmet from 'helmet';
 import he from 'he';
-import { randomBytes } from 'crypto';
+// CSRF cookie removed; we rely on Origin/Referer checks for POST /auth
 
 interface User {
     hash: string;
@@ -25,7 +25,6 @@ interface LoginQuery {
 interface LoginBody {
     username?: string;
     password?: string;
-    csrf_token?: string;
     redirect_uri?: string;
 }
 
@@ -52,7 +51,6 @@ const LOGIN_LIMITER_MAX = getEnvAsNumber('LOGIN_LIMITER_MAX', 10);
 const VERIFY_LIMITER_MAX = getEnvAsNumber('VERIFY_LIMITER_MAX', 5000);
 const AUTH_PAGE_LIMITER_MAX = getEnvAsNumber('AUTH_PAGE_LIMITER_MAX', 300);
 const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
-const CSRF_COOKIE_NAME = '__Host-csrf-token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const DOMAIN = process.env.DOMAIN;
 const DOMAIN_WILDCARD = DOMAIN ? `https://*.${DOMAIN}` : undefined;
@@ -108,6 +106,30 @@ function isDocumentRequest(req: Request): boolean {
     const dest = req.headers['sec-fetch-dest'];
     if (dest === 'document') return true;
     return acceptsHtml(req);
+}
+
+function getHeaderString(req: Request, name: string): string {
+    const value = req.headers[name.toLowerCase()];
+    if (Array.isArray(value)) return value[0] ?? '';
+    return typeof value === 'string' ? value : '';
+}
+
+function isAllowedAuthPost(req: Request): boolean {
+    const origin = getHeaderString(req, 'origin');
+    const referer = getHeaderString(req, 'referer');
+    const authOrigin = AUTH_ORIGIN;
+
+    if (origin) {
+        return origin === authOrigin;
+    }
+
+    if (referer) {
+        return referer.startsWith(`${authOrigin}/`);
+    }
+
+    // As a conservative fallback, accept only when browser hints same-origin
+    const sfs = getHeaderString(req, 'sec-fetch-site');
+    return sfs === 'same-origin';
 }
 
 // Banner feature removed to avoid redirect loops in some proxy/mobile setups
@@ -324,13 +346,6 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     res.setHeader('Cache-Control', 'no-store');
 
     const cookies = cookie.parse(req.headers.cookie ?? '');
-    if (!cookies[CSRF_COOKIE_NAME]) {
-        const csrfToken = randomBytes(32).toString('hex');
-        const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
-        res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
-
-        return res.redirect(validateRedirectUri(req.originalUrl));
-    }
 
     const rawRedirectUri = req.query.redirect_uri ?? req.body?.redirect_uri;
     const validatedDestinationUri = validateRedirectUri(rawRedirectUri ?? getOriginalUrl(req as Request));
@@ -339,12 +354,9 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     const sourceIp = req.ip;
 
     if (req.method === 'POST') {
-        const sentCsrfToken = req.body.csrf_token!;
-        const cookieCsrfToken = cookies[CSRF_COOKIE_NAME];
-
-        if (!sentCsrfToken || !cookieCsrfToken || sentCsrfToken !== cookieCsrfToken) {
-            console.warn(`[loginPageHandler] FAILED: Invalid CSRF token from IP: ${sourceIp}`);
-            res.status(403).send(getPageHTML('Error', '<h1>Invalid Request</h1><p>Your session is invalid. Please return to the login page and try again.</p>'));
+        if (!isAllowedAuthPost(req as Request)) {
+            console.warn(`[loginPageHandler] FAILED: Cross-site POST blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+            res.status(403).send(getPageHTML('Error', '<h1>Forbidden</h1><p>Invalid request origin.</p>'));
             return;
         }
 
@@ -371,14 +383,12 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
                         .sign(JWT_SECRET);
 
-                    const sessionCookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'strict', path: '/' };
+                    // Use SameSite Lax to maximize compatibility across subdomain navigations
+                    const sessionCookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'lax', path: '/' };
                     if (DOMAIN) sessionCookieOptions.domain = DOMAIN;
 
-                    const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
-
                     res.setHeader('Set-Cookie', [
-                        cookie.serialize(COOKIE_NAME, jwt, sessionCookieOptions),
-                        cookie.serialize(CSRF_COOKIE_NAME, '', { ...csrfCookieOptions, maxAge: 0 })
+                        cookie.serialize(COOKIE_NAME, jwt, sessionCookieOptions)
                     ]);
 
                     res.redirect(validatedDestinationUri);
@@ -407,10 +417,6 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         return;
     } catch {
         console.warn('[loginPageHandler] JWT verification not present/failed (likely not logged in).');
-        const csrfToken = cookies[CSRF_COOKIE_NAME];
-        const csrfCookieOptions: cookie.SerializeOptions = { secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
-
-        res.setHeader('Set-Cookie', cookie.serialize(CSRF_COOKIE_NAME, csrfToken, csrfCookieOptions));
 
         const loginMessage = req.method === 'POST'
             ? '<h1 class="login-error">Invalid username or password!</h1>'
@@ -420,7 +426,6 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             ${loginMessage}
             <form method="post" action="${AUTH_ORIGIN}/auth">
                 <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-                <input type="hidden" name="csrf_token" value="${csrfToken}" />
                 <input name="username" placeholder="Username" required autocomplete="username" />
                 <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
                 <button type="submit">Login</button>
@@ -439,11 +444,8 @@ const logoutHandler: RequestHandler = (req, res) => {
     const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
     if (!DOMAIN) delete sessionCookieOptions.domain;
 
-    const csrfCookieOptions: cookie.SerializeOptions = { maxAge: 0, secure: true, httpOnly: true, sameSite: 'strict', path: '/' };
-
     res.setHeader('Set-Cookie', [
-        cookie.serialize(COOKIE_NAME, '', sessionCookieOptions),
-        cookie.serialize(CSRF_COOKIE_NAME, '', csrfCookieOptions)
+        cookie.serialize(COOKIE_NAME, '', sessionCookieOptions)
     ]);
 
     const logoutBody = `

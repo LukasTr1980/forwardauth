@@ -97,11 +97,6 @@ if (USE_REDIS_RATE_LIMIT) {
         const url = `${proto}://${REDIS_HOST}:${REDIS_PORT}`;
         redisClient = createClient({ url, username: REDIS_USERNAME, password: REDIS_PASSWORD });
     }
-
-    const sendCommand = (...args: string[]): Promise<RedisReply> => redisClient!.sendCommand(args) as unknown as Promise<RedisReply>;
-    loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
-    verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
-    authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
 }
 
 function acceptsHtml(req: Request): boolean {
@@ -134,30 +129,10 @@ app.use(helmet.contentSecurityPolicy({
 app.use(helmet.hsts({ maxAge: 15552000, includeSubDomains: true }));
 app.set('trust proxy', 1);
 
-const loginLimiter = rateLimit({
-    windowMs: LOGIN_LIMITER_WINDOW_S * 1000,
-    limit: LOGIN_LIMITER_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: 'Too many login attempts from this IP, please try again after 15 minutes',
-    ...(loginStore ? { store: loginStore } : {}),
-});
-const verifyLimiter = rateLimit({
-    windowMs: VERIFY_LIMITER_WINDOW_S * 1000,
-    limit: VERIFY_LIMITER_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: 'Too many requests from this IP, please try again later',
-    ...(verifyStore ? { store: verifyStore } : {}),
-})
-const authPageLimiter = rateLimit({
-    windowMs: AUTH_PAGE_LIMITER_WINDOW_S * 1000,
-    limit: AUTH_PAGE_LIMITER_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: 'Too many requests from this IP, please try again later',
-    ...(authPageStore ? { store: authPageStore } : {}),
-})
+// Rate limiters will be created after optional Redis connect
+let loginLimiter: RequestHandler;
+let verifyLimiter: RequestHandler;
+let authPageLimiter: RequestHandler;
 
 // Toast page removed
 
@@ -479,17 +454,6 @@ const logoutHandler: RequestHandler = (req, res) => {
     res.status(200).send(getPageHTML('Logged Out', logoutBody));
 };
 
-app.get('/', (req, res) => {
-    res.redirect('/auth');
-})
-
-app.post('/auth', loginLimiter, loginPageHandler);
-app.get('/auth', authPageLimiter, loginPageHandler);
-app.get('/logout', logoutHandler);
-app.get('/verify', verifyLimiter, verifyHandler);
-
-// Removed /still-logged route
-
 void (async () => {
     await loadUsers();
 
@@ -503,6 +467,51 @@ void (async () => {
                 process.exit(1);
             }
         }
+
+        // Create Redis-backed stores once connected
+        if (USE_REDIS_RATE_LIMIT && redisClient) {
+            const sendCommand = (...args: string[]): Promise<RedisReply> => redisClient.sendCommand(args);
+            loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
+            verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
+            authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
+        }
+
+        // Initialize rate limiters (with or without Redis store)
+        loginLimiter = rateLimit({
+            windowMs: LOGIN_LIMITER_WINDOW_S * 1000,
+            limit: LOGIN_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Too many login attempts from this IP, please try again after 15 minutes',
+            ...(loginStore ? { store: loginStore } : {}),
+        });
+        verifyLimiter = rateLimit({
+            windowMs: VERIFY_LIMITER_WINDOW_S * 1000,
+            limit: VERIFY_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Too many requests from this IP, please try again later',
+            ...(verifyStore ? { store: verifyStore } : {}),
+        });
+        authPageLimiter = rateLimit({
+            windowMs: AUTH_PAGE_LIMITER_WINDOW_S * 1000,
+            limit: AUTH_PAGE_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Too many requests from this IP, please try again later',
+            ...(authPageStore ? { store: authPageStore } : {}),
+        });
+
+        // Register routes after limiters are ready
+        app.get('/', (req, res) => {
+            res.redirect('/auth');
+        });
+        app.post('/auth', loginLimiter, loginPageHandler);
+        app.get('/auth', authPageLimiter, loginPageHandler);
+        app.get('/logout', logoutHandler);
+        app.get('/verify', verifyLimiter, verifyHandler);
+
+        // Removed /still-logged route
 
         // Poll for changes in users.json and reload on modifications
         watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {

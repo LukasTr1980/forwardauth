@@ -1,11 +1,13 @@
 import express, { type Request, type RequestHandler } from 'express';
 import { type ParamsDictionary } from 'express-serve-static-core';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { type Store as RateLimitStore } from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
+import { createClient, type RedisClientType } from 'redis';
 import * as cookie from 'cookie';
 import { SignJWT, jwtVerify } from 'jose';
 import argon2 from 'argon2';
 import fs from 'fs/promises';
-import { watchFile } from 'node:fs';
+import { watchFile, readFileSync } from 'node:fs';
 import path from 'path';
 import helmet from 'helmet';
 import he from 'he';
@@ -60,6 +62,50 @@ const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 
+function getEnvSecret(key: string, fileKey: string): string | undefined {
+    const filePath = process.env[fileKey];
+    if (filePath) {
+        try {
+            return readFileSync(filePath, 'utf-8').trim();
+        } catch (error) {
+            console.error(`[rate-limit] Failed reading secret file from ${filePath}:`, error);
+        }
+    }
+    return process.env[key];
+}
+
+// Optional Redis-backed rate limiting for multi-instance deployments
+const REDIS_URL = process.env.REDIS_URL;
+const REDIS_HOST = process.env.REDIS_HOST;
+const REDIS_PORT = getEnvAsNumber('REDIS_PORT', 6379);
+const REDIS_USERNAME = process.env.REDIS_USERNAME;
+const REDIS_PASSWORD = getEnvSecret('REDIS_PASSWORD', 'REDIS_PASSWORD_FILE');
+const REDIS_TLS = process.env.REDIS_TLS === '1' || process.env.REDIS_TLS === 'true';
+
+const USE_REDIS_RATE_LIMIT = Boolean(REDIS_URL ?? REDIS_HOST);
+
+let redisClient: RedisClientType | undefined;
+let loginStore: RateLimitStore | undefined;
+let verifyStore: RateLimitStore | undefined;
+let authPageStore: RateLimitStore | undefined;
+
+if (USE_REDIS_RATE_LIMIT) {
+    if (REDIS_URL) {
+        redisClient = createClient({ url: REDIS_URL });
+    } else {
+        redisClient = createClient({
+            socket: { host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
+            username: REDIS_USERNAME,
+            password: REDIS_PASSWORD,
+        });
+    }
+
+    const sendCommand = (...args: string[]) => redisClient!.sendCommand(args);
+    loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
+    verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
+    authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
+}
+
 function acceptsHtml(req: Request): boolean {
     const accept = req.headers.accept ?? '';
     return typeof accept === 'string' && accept.includes('text/html');
@@ -96,6 +142,7 @@ const loginLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many login attempts from this IP, please try again after 15 minutes',
+    ...(loginStore ? { store: loginStore } : {}),
 });
 const verifyLimiter = rateLimit({
     windowMs: VERIFY_LIMITER_WINDOW_S * 1000,
@@ -103,6 +150,7 @@ const verifyLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many requests from this IP, please try again later',
+    ...(verifyStore ? { store: verifyStore } : {}),
 })
 const authPageLimiter = rateLimit({
     windowMs: AUTH_PAGE_LIMITER_WINDOW_S * 1000,
@@ -110,6 +158,7 @@ const authPageLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many requests from this IP, please try again later',
+    ...(authPageStore ? { store: authPageStore } : {}),
 })
 
 // Toast page removed
@@ -447,6 +496,16 @@ void (async () => {
     await loadUsers();
 
     try {
+        if (USE_REDIS_RATE_LIMIT && redisClient) {
+            try {
+                await redisClient.connect();
+                console.log('[rate-limit] Connected to Redis for rate limiting');
+            } catch (error) {
+                console.error('[rate-limit] FATAL: Failed to connect to Redis for rate limiting.', error);
+                process.exit(1);
+            }
+        }
+
         // Poll for changes in users.json and reload on modifications
         watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
             if (curr.mtimeMs !== prev.mtimeMs) {

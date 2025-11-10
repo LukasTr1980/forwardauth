@@ -297,7 +297,7 @@ interface SessionStore {
 class RedisSessionStore implements SessionStore {
     private readonly client: RedisClientType;
     private readonly keySessionPrefix = 'sess:token:'; // sess:token:<jti> -> username
-    private readonly keyUserZsetPrefix = 'sess:user:'; // sess:user:<user> -> ZSET of jti scored by issuedAt
+    private readonly keyUserZsetPrefix = 'sess:user:'; // sess:user:<user> -> ZSET of jti scored by expiry (ms epoch)
 
     constructor(client: RedisClientType) {
         this.client = client;
@@ -308,16 +308,20 @@ class RedisSessionStore implements SessionStore {
 
     async addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number): Promise<boolean> {
         const userKey = this.keyUser(user);
-        const now = Date.now();
+        const nowMs = Date.now();
+        const expiryMs = nowMs + ttlSeconds * 1000;
 
-        // Reject when limit reached
+        // Robust prune: drop expired JTIs from the index before counting
+        await this.client.zRemRangeByScore(userKey, '-inf', nowMs);
+
+        // Reject when limit reached (only active JTIs remain)
         const count = await this.client.zCard(userKey);
         if (count >= maxSessions) return false;
 
-        // Add new session
+        // Add new session atomically
         await this.client.multi()
             .set(this.keySession(jti), user, { EX: ttlSeconds })
-            .zAdd(userKey, [{ score: now, value: jti }])
+            .zAdd(userKey, [{ score: expiryMs, value: jti }])
             .exec();
 
         return true;
@@ -325,8 +329,12 @@ class RedisSessionStore implements SessionStore {
 
     async isActive(user: string, jti: string): Promise<boolean> {
         if (!jti) return false;
-        const val = await this.client.get(this.keySession(jti));
-        return val === user;
+        const key = this.keySession(jti);
+        const val = await this.client.get(key);
+        if (val === user) return true;
+        // Housekeeping: remove stale ZSET member if present (e.g., TTL already expired)
+        await this.client.zRem(this.keyUser(user), jti);
+        return false;
     }
 
     async removeSession(user: string, jti: string): Promise<void> {

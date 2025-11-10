@@ -11,6 +11,7 @@ import { watchFile, readFileSync } from 'node:fs';
 import path from 'path';
 import helmet from 'helmet';
 import he from 'he';
+import { randomUUID } from 'node:crypto';
 // CSRF cookie removed; we rely on Origin/Referer checks for POST /auth
 
 interface User {
@@ -59,6 +60,9 @@ const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
+const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
+type SessionStrategy = 'reject' | 'evict_oldest';
+const SESSION_LIMIT_STRATEGY: SessionStrategy = (process.env.SESSION_LIMIT_STRATEGY === 'reject') ? 'reject' : 'evict_oldest';
 
 function getEnvSecret(key: string, fileKey: string): string | undefined {
     const filePath = process.env[fileKey];
@@ -282,6 +286,141 @@ const getPageHTML = (title: string, body: string): string => `
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static('public'));
 
+// -----------------------------
+// Session limiting infrastructure
+// -----------------------------
+
+interface SessionStore {
+    addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number, strategy: SessionStrategy): Promise<boolean>;
+    isActive(user: string, jti: string): Promise<boolean>;
+    removeSession(user: string, jti: string): Promise<void>;
+}
+
+class RedisSessionStore implements SessionStore {
+    private readonly client: RedisClientType;
+    private readonly keySessionPrefix = 'sess:token:'; // sess:token:<jti> -> username
+    private readonly keyUserZsetPrefix = 'sess:user:'; // sess:user:<user> -> ZSET of jti scored by issuedAt
+
+    constructor(client: RedisClientType) {
+        this.client = client;
+    }
+
+    private keySession(jti: string): string { return `${this.keySessionPrefix}${jti}`; }
+    private keyUser(user: string): string { return `${this.keyUserZsetPrefix}${user}`; }
+
+    async addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number, strategy: SessionStrategy): Promise<boolean> {
+        const userKey = this.keyUser(user);
+        const now = Date.now();
+
+        // Early reject if configured
+        if (strategy === 'reject') {
+            const count = await this.client.zCard(userKey);
+            if (count >= maxSessions) return false;
+        }
+
+        // Add new session
+        await this.client.multi()
+            .set(this.keySession(jti), user, { EX: ttlSeconds })
+            .zAdd(userKey, [{ score: now, value: jti }])
+            .exec();
+
+        // Trim oldest if over limit
+        const countAfter = await this.client.zCard(userKey);
+        const removeCount = countAfter - maxSessions;
+        if (removeCount > 0) {
+            const oldest = await this.client.zRange(userKey, 0, removeCount - 1);
+            if (oldest.length > 0) {
+                const pipeline = this.client.multi();
+                for (const oldJti of oldest) {
+                    pipeline.del(this.keySession(oldJti));
+                    pipeline.zRem(userKey, oldJti);
+                }
+                await pipeline.exec();
+            }
+        }
+        return true;
+    }
+
+    async isActive(user: string, jti: string): Promise<boolean> {
+        if (!jti) return false;
+        const val = await this.client.get(this.keySession(jti));
+        return val === user;
+    }
+
+    async removeSession(user: string, jti: string): Promise<void> {
+        if (!jti) return;
+        await this.client.multi()
+            .del(this.keySession(jti))
+            .zRem(this.keyUser(user), jti)
+            .exec();
+    }
+}
+
+class MemorySessionStore implements SessionStore {
+    // user -> jti -> { createdAt, expiresAt }
+    private readonly sessions = new Map<string, Map<string, { createdAt: number; expiresAt: number }>>();
+
+    private prune(user: string) {
+        const map = this.sessions.get(user);
+        if (!map) return;
+        const now = Date.now();
+        for (const [jti, meta] of map) {
+            if (meta.expiresAt <= now) {
+                map.delete(jti);
+            }
+        }
+        if (map.size === 0) this.sessions.delete(user);
+    }
+
+    addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number, strategy: SessionStrategy): Promise<boolean> {
+        const now = Date.now();
+        const expiresAt = now + ttlSeconds * 1000;
+        const map = this.sessions.get(user) ?? new Map<string, { createdAt: number; expiresAt: number }>();
+        this.sessions.set(user, map);
+
+        this.prune(user);
+
+        if (strategy === 'reject' && map.size >= maxSessions) {
+            return Promise.resolve(false);
+        }
+
+        map.set(jti, { createdAt: now, expiresAt });
+
+        // Evict oldest if necessary
+        while (map.size > maxSessions) {
+            let oldestJti = '';
+            let oldestTs = Number.POSITIVE_INFINITY;
+            for (const [curJti, meta] of map) {
+                if (meta.createdAt < oldestTs) {
+                    oldestTs = meta.createdAt;
+                    oldestJti = curJti;
+                }
+            }
+            if (oldestJti) map.delete(oldestJti);
+            else break;
+        }
+
+        return Promise.resolve(true);
+    }
+
+    isActive(user: string, jti: string): Promise<boolean> {
+        if (!jti) return Promise.resolve(false);
+        this.prune(user);
+        const map = this.sessions.get(user);
+        return Promise.resolve(map?.has(jti) ?? false);
+    }
+
+    removeSession(user: string, jti: string): Promise<void> {
+        const map = this.sessions.get(user);
+        if (!map) return Promise.resolve();
+        map.delete(jti);
+        if (map.size === 0) this.sessions.delete(user);
+        return Promise.resolve();
+    }
+}
+
+let sessionStore: SessionStore;
+
 const verifyHandler: RequestHandler = async (req, res) => {
     const sourceIp = req.ip;
     console.log(`[verifyHandler] Verifying request from IP: ${sourceIp}`);
@@ -313,6 +452,14 @@ const verifyHandler: RequestHandler = async (req, res) => {
             return;
         }
 
+        // Enforce active session check when token carries a JTI
+        if (typeof payload.jti === 'string') {
+            const active = await sessionStore.isActive(payload.sub, payload.jti);
+            if (!active) {
+                throw new Error('Session not active');
+            }
+        }
+
         console.log(`[verifyHandler] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
 
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
@@ -327,7 +474,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         res.sendStatus(200);
         return;
     } catch (error) {
-        const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid or expired token';
+        const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid, expired, or inactive session token';
         console.warn(`[verifyHandler] Verification failed for IP ${sourceIp}: ${reason}`);
 
         const originalUrl = getOriginalUrl(req);
@@ -375,10 +522,30 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                 if (isMatch && hash) {
                     console.log(`[loginPageHandler] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
 
+                    const jti = randomUUID();
+                    // Register session before issuing the cookie, enforcing max active sessions
+                    const allowed = await sessionStore.addSession(user, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER, SESSION_LIMIT_STRATEGY);
+                    if (!allowed) {
+                        console.warn(`[loginPageHandler] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
+                        const message = '<h1 class="login-error">Too many active sessions for this account. Please log out on another device and try again.</h1>';
+                        const loginFormBody = `
+                            ${message}
+                            <form method="post" action="${AUTH_ORIGIN}/auth">
+                                <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
+                                <input name="username" placeholder="Username" required autocomplete="username" />
+                                <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
+                                <button type="submit">Login</button>
+                            </form>
+                        `;
+                        res.status(429).send(getPageHTML('Too many sessions', loginFormBody));
+                        return;
+                    }
+
                     const jwt = await new SignJWT({})
                         .setProtectedHeader({ alg: 'HS256' })
                         .setIssuer(JWT_ISSUER)
                         .setSubject(user)
+                        .setJti(jti)
                         .setIssuedAt()
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
                         .sign(JWT_SECRET);
@@ -436,13 +603,27 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     }
 };
 
-const logoutHandler: RequestHandler = (req, res) => {
+const logoutHandler: RequestHandler = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
     console.log(`[logoutHandler] User logged out from IP :${req.ip}`);
 
     const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
     if (!DOMAIN) delete sessionCookieOptions.domain;
+
+    // Best-effort revoke of current session
+    try {
+        const parsedCookies = cookie.parse(req.headers.cookie ?? '');
+        const token = parsedCookies[COOKIE_NAME];
+        if (token) {
+            const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+            if (typeof payload.sub === 'string' && typeof payload.jti === 'string') {
+                await sessionStore.removeSession(payload.sub, payload.jti);
+            }
+        }
+    } catch {
+        // ignore errors; still clear cookie
+    }
 
     res.setHeader('Set-Cookie', [
         cookie.serialize(COOKIE_NAME, '', sessionCookieOptions)
@@ -503,6 +684,15 @@ void (async () => {
             message: 'Too many requests from this IP, please try again later',
             ...(authPageStore ? { store: authPageStore } : {}),
         });
+
+        // Initialize session store (Redis if configured; memory otherwise)
+        if (redisClient) {
+            sessionStore = new RedisSessionStore(redisClient);
+            console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: ${SESSION_LIMIT_STRATEGY}`);
+        } else {
+            sessionStore = new MemorySessionStore();
+            console.log(`[sessions] Using in-memory session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: ${SESSION_LIMIT_STRATEGY}`);
+        }
 
         // Register routes after limiters are ready
         app.get('/', (req, res) => {

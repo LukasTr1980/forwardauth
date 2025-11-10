@@ -61,8 +61,6 @@ const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
-type SessionStrategy = 'reject' | 'evict_oldest';
-const SESSION_LIMIT_STRATEGY: SessionStrategy = (process.env.SESSION_LIMIT_STRATEGY === 'reject') ? 'reject' : 'evict_oldest';
 
 function getEnvSecret(key: string, fileKey: string): string | undefined {
     const filePath = process.env[fileKey];
@@ -291,7 +289,7 @@ app.use(express.static('public'));
 // -----------------------------
 
 interface SessionStore {
-    addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number, strategy: SessionStrategy): Promise<boolean>;
+    addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number): Promise<boolean>;
     isActive(user: string, jti: string): Promise<boolean>;
     removeSession(user: string, jti: string): Promise<void>;
 }
@@ -308,15 +306,13 @@ class RedisSessionStore implements SessionStore {
     private keySession(jti: string): string { return `${this.keySessionPrefix}${jti}`; }
     private keyUser(user: string): string { return `${this.keyUserZsetPrefix}${user}`; }
 
-    async addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number, strategy: SessionStrategy): Promise<boolean> {
+    async addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number): Promise<boolean> {
         const userKey = this.keyUser(user);
         const now = Date.now();
 
-        // Early reject if configured
-        if (strategy === 'reject') {
-            const count = await this.client.zCard(userKey);
-            if (count >= maxSessions) return false;
-        }
+        // Reject when limit reached
+        const count = await this.client.zCard(userKey);
+        if (count >= maxSessions) return false;
 
         // Add new session
         await this.client.multi()
@@ -324,20 +320,6 @@ class RedisSessionStore implements SessionStore {
             .zAdd(userKey, [{ score: now, value: jti }])
             .exec();
 
-        // Trim oldest if over limit
-        const countAfter = await this.client.zCard(userKey);
-        const removeCount = countAfter - maxSessions;
-        if (removeCount > 0) {
-            const oldest = await this.client.zRange(userKey, 0, removeCount - 1);
-            if (oldest.length > 0) {
-                const pipeline = this.client.multi();
-                for (const oldJti of oldest) {
-                    pipeline.del(this.keySession(oldJti));
-                    pipeline.zRem(userKey, oldJti);
-                }
-                await pipeline.exec();
-            }
-        }
         return true;
     }
 
@@ -372,7 +354,7 @@ class MemorySessionStore implements SessionStore {
         if (map.size === 0) this.sessions.delete(user);
     }
 
-    addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number, strategy: SessionStrategy): Promise<boolean> {
+    addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number): Promise<boolean> {
         const now = Date.now();
         const expiresAt = now + ttlSeconds * 1000;
         const map = this.sessions.get(user) ?? new Map<string, { createdAt: number; expiresAt: number }>();
@@ -380,25 +362,11 @@ class MemorySessionStore implements SessionStore {
 
         this.prune(user);
 
-        if (strategy === 'reject' && map.size >= maxSessions) {
+        if (map.size >= maxSessions) {
             return Promise.resolve(false);
         }
 
         map.set(jti, { createdAt: now, expiresAt });
-
-        // Evict oldest if necessary
-        while (map.size > maxSessions) {
-            let oldestJti = '';
-            let oldestTs = Number.POSITIVE_INFINITY;
-            for (const [curJti, meta] of map) {
-                if (meta.createdAt < oldestTs) {
-                    oldestTs = meta.createdAt;
-                    oldestJti = curJti;
-                }
-            }
-            if (oldestJti) map.delete(oldestJti);
-            else break;
-        }
 
         return Promise.resolve(true);
     }
@@ -524,7 +492,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 
                     const jti = randomUUID();
                     // Register session before issuing the cookie, enforcing max active sessions
-                    const allowed = await sessionStore.addSession(user, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER, SESSION_LIMIT_STRATEGY);
+                    const allowed = await sessionStore.addSession(user, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
                     if (!allowed) {
                         console.warn(`[loginPageHandler] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
                         const message = '<h1 class="login-error">Too many active sessions for this account. Please log out on another device and try again.</h1>';
@@ -573,7 +541,34 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     try {
         const token = cookies[COOKIE_NAME];
         if (!token) throw new Error('Not logged in');
-        await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+        const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+
+        // If token carries JTI but session is not active anymore, treat as logged out.
+        if (typeof payload.sub === 'string' && typeof payload.jti === 'string') {
+            const stillActive = await sessionStore.isActive(payload.sub, payload.jti);
+            if (!stillActive) {
+                console.warn('[loginPageHandler] Inactive session token detected on /auth; clearing cookie and showing login form.');
+
+                const clearCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
+                if (!DOMAIN) delete clearCookieOptions.domain;
+                res.setHeader('Set-Cookie', [
+                    cookie.serialize(COOKIE_NAME, '', clearCookieOptions)
+                ]);
+
+                const message = '<h1 class="login-error">You have been signed out on this device because you logged in elsewhere. Please login again.</h1>';
+                const loginFormBody = `
+                    ${message}
+                    <form method="post" action="${AUTH_ORIGIN}/auth">
+                        <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
+                        <input name="username" placeholder="Username" required autocomplete="username" />
+                        <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
+                        <button type="submit">Login</button>
+                    </form>
+                `;
+                res.status(401).send(getPageHTML('Login', loginFormBody));
+                return;
+            }
+        }
 
         const loggedInBody = `
             <h1>Authenticated</h1>
@@ -688,10 +683,10 @@ void (async () => {
         // Initialize session store (Redis if configured; memory otherwise)
         if (redisClient) {
             sessionStore = new RedisSessionStore(redisClient);
-            console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: ${SESSION_LIMIT_STRATEGY}`);
+            console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: reject`);
         } else {
             sessionStore = new MemorySessionStore();
-            console.log(`[sessions] Using in-memory session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: ${SESSION_LIMIT_STRATEGY}`);
+            console.log(`[sessions] Using in-memory session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: reject`);
         }
 
         // Register routes after limiters are ready

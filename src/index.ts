@@ -312,14 +312,27 @@ class RedisSessionStore implements SessionStore {
         const nowMs = Date.now();
         const expiryMs = nowMs + ttlSeconds * 1000;
 
-        // Robust prune: drop expired JTIs from the index before counting
+        // 1) Remove expired sessions from index (by expiry score)
         await this.client.zRemRangeByScore(userKey, '-inf', nowMs);
 
-        // Reject when limit reached (only active JTIs remain)
-        const count = await this.client.zCard(userKey);
-        if (count >= maxSessions) return false;
+        // 2) Count active sessions
+        let count = await this.client.zCard(userKey);
 
-        // Add new session atomically
+        // 3) If limit reached, evict oldest active session (Last-Login-Wins)
+        if (count >= maxSessions) {
+            const oldest = await this.client.zRange(userKey, 0, 0);
+            if (oldest.length > 0) {
+                const oldestJti = oldest[0];
+                await this.client.multi()
+                    .del(this.keySession(oldestJti))
+                    .zRem(userKey, oldestJti)
+                    .exec();
+                count--;
+                console.log(`[sessions] Evicted oldest session for user "${user}" (jti=${oldestJti}) to respect maxSessions=${maxSessions}`);
+            }
+        }
+
+        // 4) Add new session
         await this.client.multi()
             .set(this.keySession(jti), user, { EX: ttlSeconds })
             .zAdd(userKey, [{ score: expiryMs, value: jti }])

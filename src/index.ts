@@ -36,7 +36,7 @@ function getEnvAsNumber(key: string, defaultValue: number): number {
 
 const secretEnv = process.env.JWT_SECRET;
 if (!secretEnv) {
-    console.error('FATAL: JWT_SECRET environment variable is not set.');
+    console.error('[config] FATAL: JWT_SECRET environment variable is not set.');
     process.exit(1);
 }
 
@@ -68,7 +68,7 @@ function getEnvSecret(key: string, fileKey: string): string | undefined {
         try {
             return readFileSync(filePath, 'utf-8').trim();
         } catch (error) {
-            console.error(`[rate-limit] Failed reading secret file from ${filePath}:`, error);
+            console.error(`[config] Failed reading secret file from ${filePath}:`, error);
         }
     }
     return process.env[key];
@@ -83,7 +83,7 @@ const REDIS_PASSWORD = getEnvSecret('REDIS_PASSWORD', 'REDIS_PASSWORD_FILE');
 const REDIS_TLS = process.env.REDIS_TLS === '1' || process.env.REDIS_TLS === 'true';
 
 if (!REDIS_URL && !REDIS_HOST) {
-    console.error('FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT).');
+    console.error('[config] FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT).');
     process.exit(1);
 }
 
@@ -98,6 +98,54 @@ if (REDIS_URL) {
     const proto = REDIS_TLS ? 'rediss' : 'redis';
     const url = `${proto}://${REDIS_HOST}:${REDIS_PORT}`;
     redisClient = createClient({ url, username: REDIS_USERNAME, password: REDIS_PASSWORD });
+}
+
+function sanitizeRedisUrl(urlStr?: string): string | undefined {
+    if (!urlStr) return undefined;
+    try {
+        const u = new URL(urlStr);
+        const hostPort = u.port ? `${u.hostname}:${u.port}` : u.hostname;
+        return `${u.protocol}//${hostPort}`;
+    } catch {
+        return undefined;
+    }
+}
+
+function logStartupConfig(): void {
+    const cfg = {
+        port: PORT,
+        domain: DOMAIN ?? '(unset)',
+        cookieName: COOKIE_NAME,
+        jwtIssuer: JWT_ISSUER,
+        loginRedirectUrl: LOGIN_REDIRECT_URL,
+        cookieMaxAgeS: COOKIE_MAX_AGE_S,
+        sessionMaxPerUser: MAX_SESSIONS_PER_USER,
+        windows: {
+            loginLimiterWindowS: LOGIN_LIMITER_WINDOW_S,
+            verifyLimiterWindowS: VERIFY_LIMITER_WINDOW_S,
+            authPageLimiterWindowS: AUTH_PAGE_LIMITER_WINDOW_S,
+        },
+        limits: {
+            loginLimiterMax: LOGIN_LIMITER_MAX,
+            verifyLimiterMax: VERIFY_LIMITER_MAX,
+            authPageLimiterMax: AUTH_PAGE_LIMITER_MAX,
+        },
+        users: {
+            file: USER_FILE,
+            watchIntervalMs: USER_FILE_WATCH_INTERVAL_MS,
+        },
+        redis: REDIS_URL
+            ? { mode: 'url', url: sanitizeRedisUrl(REDIS_URL), tls: REDIS_TLS }
+            : { mode: 'host', host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
+        secrets: {
+            jwtSecret: secretEnv ? 'set' : 'unset',
+            redisPassword: REDIS_PASSWORD ? 'set' : 'unset',
+            redisUsername: REDIS_USERNAME ? 'set' : 'unset',
+        },
+    } as const;
+
+    // Single structured log line for easier ingestion
+    console.log(`[config] ${JSON.stringify(cfg)}`);
 }
 
 function acceptsHtml(req: Request): boolean {
@@ -154,7 +202,7 @@ app.use(helmet.contentSecurityPolicy({
 app.use(helmet.hsts({ maxAge: 15552000, includeSubDomains: true }));
 app.set('trust proxy', 1);
 
-// Rate limiters will be created after optional Redis connect
+// Rate limiters are created after Redis connect
 let loginLimiter: RequestHandler;
 let verifyLimiter: RequestHandler;
 let authPageLimiter: RequestHandler;
@@ -226,13 +274,13 @@ async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
         }
 
         users = raw;
-        console.log(`Loaded ${Object.keys(users).length} users from ${USER_FILE}`);
+        console.log(`[users] Loaded ${Object.keys(users).length} users from ${USER_FILE}`);
     } catch (error) {
         if (fatal) {
-            console.error(`FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
+            console.error(`[users] FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
             process.exit(1);
         } else {
-            console.warn(`WARN: Reloading users failed; keeping previous users. (${(error as Error).message})`);
+            console.warn(`[users] Reloading users failed; keeping previous users. (${(error as Error).message})`);
         }
     }
 }
@@ -247,13 +295,13 @@ function validateRedirectUri(uri: string): string {
             return uri;
         }
 
-        console.warn(`[validateRedirectUri] Blocked potential open redirect to: ${uri}`);
+        console.warn(`[redirect] Blocked potential open redirect to: ${uri}`);
         return defaultRedirect;
     } catch (error) {
         if (uri.startsWith('/') && !uri.startsWith('//')) {
             return uri;
         }
-        console.warn('[validateRedirectUri] Invalid redirect URI provided: %s', uri, error);
+        console.warn('[redirect] Invalid redirect URI provided: %s', uri, error);
         return defaultRedirect;
     }
 }
@@ -366,7 +414,7 @@ let sessionStore: SessionStore;
 
 const verifyHandler: RequestHandler = async (req, res) => {
     const sourceIp = req.ip;
-    console.log(`[verifyHandler] Verifying request from IP: ${sourceIp}`);
+    console.log(`[verify] Verifying request from IP: ${sourceIp}`);
 
     try {
         const parsedCookies = cookie.parse(req.headers.cookie ?? '');
@@ -390,7 +438,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         }
 
         if (!isHostAllowed(requestedHost, userRecord.allowedHosts)) {
-            console.warn(`[verifyHandler] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
+            console.warn(`[verify] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
             res.status(403).set('Cache-Control', 'no-store').end('Forbidden');
             return;
         }
@@ -403,7 +451,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
             }
         }
 
-        console.log(`[verifyHandler] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
+        console.log(`[verify] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
 
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
             res.set('X-Forwarded-User', payload.sub);
@@ -418,7 +466,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         return;
     } catch (error) {
         const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid, expired, or inactive session token';
-        console.warn(`[verifyHandler] Verification failed for IP ${sourceIp}: ${reason}`);
+        console.warn(`[verify] Verification failed for IP ${sourceIp}: ${reason}`);
 
         const originalUrl = getOriginalUrl(req);
 
@@ -445,14 +493,14 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 
     if (req.method === 'POST') {
         if (!isAllowedAuthPost(req as Request)) {
-            console.warn(`[loginPageHandler] FAILED: Cross-site POST blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+            console.warn(`[auth] Cross-site POST blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
             res.status(403).send(getPageHTML('Error', '<h1>Forbidden</h1><p>Invalid request origin.</p>'));
             return;
         }
 
         const user = req.body.username!;
         const pass = req.body.password!;
-        console.log(`[loginPageHandler] Login attempt for user "${user}" from IP: ${sourceIp}`);
+        console.log(`[auth] Login attempt for user "${user}" from IP: ${sourceIp}`);
 
         if (user && pass) {
             const userObject = users[user];
@@ -463,13 +511,13 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             try {
                 const isMatch = await argon2.verify(hashToVerify, pass);
                 if (isMatch && hash) {
-                    console.log(`[loginPageHandler] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
+                    console.log(`[auth] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
 
                     const jti = randomUUID();
                     // Register session before issuing the cookie, enforcing max active sessions
                     const allowed = await sessionStore.addSession(user, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
                     if (!allowed) {
-                        console.warn(`[loginPageHandler] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
+                        console.warn(`[auth] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
                         const message = '<h1 class="login-error">Too many active sessions for this account. Please log out on another device and try again.</h1>';
                         const loginFormBody = `
                             ${message}
@@ -505,12 +553,12 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     return;
                 }
             } catch (error) {
-                console.error('Internal error during argon2 verification', error);
+                console.error('[auth] Internal error during argon2 verification', error);
                 res.status(500).send(getPageHTML('Error', '<h1>Internal Server Error</h1><p>An unexpected error occurred. Please try again later.</p>'));
                 return;
             }
         }
-        console.warn(`[loginPageHandler] FAILED: Authentication attempt from IP: ${sourceIp}`);
+        console.warn(`[auth] FAILED: Authentication attempt from IP: ${sourceIp}`);
     }
 
     try {
@@ -522,7 +570,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         if (typeof payload.sub === 'string' && typeof payload.jti === 'string') {
             const stillActive = await sessionStore.isActive(payload.sub, payload.jti);
             if (!stillActive) {
-                console.warn('[loginPageHandler] Inactive session token detected on /auth; clearing cookie and showing login form.');
+                console.warn('[auth] Inactive session token detected on /auth; clearing cookie and showing login form.');
 
                 const clearCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
                 if (!DOMAIN) delete clearCookieOptions.domain;
@@ -553,7 +601,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         res.status(200).send(getPageHTML('Authenticated', loggedInBody));
         return;
     } catch {
-        console.warn('[loginPageHandler] JWT verification not present/failed (likely not logged in).');
+        console.warn('[auth] JWT verification not present/failed (likely not logged in).');
 
         const loginMessage = req.method === 'POST'
             ? '<h1 class="login-error">Invalid username or password!</h1>'
@@ -576,7 +624,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 const logoutHandler: RequestHandler = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
-    console.log(`[logoutHandler] User logged out from IP :${req.ip}`);
+    console.log(`[logout] User logged out from IP: ${req.ip}`);
 
     const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
     if (!DOMAIN) delete sessionCookieOptions.domain;
@@ -609,6 +657,9 @@ const logoutHandler: RequestHandler = async (req, res) => {
 
 void (async () => {
     await loadUsers();
+
+    // Log effective configuration once at startup (secrets masked)
+    logStartupConfig();
 
     try {
         // Connect to Redis (required)
@@ -654,7 +705,7 @@ void (async () => {
 
         // Initialize session store (Redis only)
         sessionStore = new RedisSessionStore(redisClient);
-        console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: reject`);
+        console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: last-login-wins`);
 
         // Register routes after limiters are ready
         app.get('/', (req, res) => {
@@ -670,25 +721,25 @@ void (async () => {
         // Poll for changes in users.json and reload on modifications
         watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
             if (curr.mtimeMs !== prev.mtimeMs) {
-                console.log(`[users.json] Change detected (mtime). Reloading users from ${USER_FILE}...`);
+                console.log(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
                 void loadUsers({ fatal: false });
             }
         });
 
         process.on('SIGHUP', () => {
-            console.log('[users.json] SIGHUP received. Reloading users...');
+            console.log('[users] SIGHUP received. Reloading users...');
             void loadUsers({ fatal: false });
         });
     } catch (error) {
-        console.warn('[users.json] Failed to initialize watch/polling for users file.', error);
+        console.warn('[users] Failed to initialize watch/polling for users file.', error);
     }
 
     app.listen(PORT, () => {
-        console.log(`ForwardAuth-Server running on port: ${PORT}`);
+        console.log(`[server] ForwardAuth listening on port ${PORT}`);
         if (!DOMAIN) {
-            console.warn('WARN: DOMAIN environment variable is not set. Cookies may not work across subdomains.');
+            console.warn('[config] DOMAIN is not set. Cookies may not work across subdomains.');
         } else {
-            console.log(`Cookies will be set for domain: ${DOMAIN}`);
+            console.log(`[config] Cookies will be set for domain: ${DOMAIN}`);
         }
     })
 })();

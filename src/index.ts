@@ -34,9 +34,22 @@ function getEnvAsNumber(key: string, defaultValue: number): number {
     return Number.isFinite(value) ? value : defaultValue;
 }
 
+// Simple log level gate: LOG_LEVEL=debug|info|warn|error|silent (default: info)
+type LogLevelName = 'debug' | 'info' | 'warn' | 'error' | 'silent';
+const LOG_LEVEL_ENV = (process.env.LOG_LEVEL ?? 'info').toLowerCase() as LogLevelName;
+const LOG_LEVELS: Record<Exclude<LogLevelName, never>, number> = { debug: 10, info: 20, warn: 30, error: 40, silent: 100 };
+const CURRENT_LEVEL = LOG_LEVELS[LOG_LEVEL_ENV] ?? LOG_LEVELS.info;
+
+const logger = {
+    debug: (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.debug) console.debug(...args as []); },
+    info:  (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.info)  console.log(...args as []); },
+    warn:  (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.warn)  console.warn(...args as []); },
+    error: (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.error) console.error(...args as []); },
+} as const;
+
 const secretEnv = process.env.JWT_SECRET;
 if (!secretEnv) {
-    console.error('[config] FATAL: JWT_SECRET environment variable is not set.');
+    logger.error('[config] FATAL: JWT_SECRET environment variable is not set.');
     process.exit(1);
 }
 
@@ -64,13 +77,14 @@ const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
 
+
 function getEnvSecret(key: string, fileKey: string): string | undefined {
     const filePath = process.env[fileKey];
     if (filePath) {
         try {
             return readFileSync(filePath, 'utf-8').trim();
         } catch (error) {
-            console.error(`[config] Failed reading secret file from ${filePath}:`, error);
+            logger.error(`[config] Failed reading secret file from ${filePath}:`, error);
         }
     }
     return process.env[key];
@@ -85,7 +99,7 @@ const REDIS_PASSWORD = getEnvSecret('REDIS_PASSWORD', 'REDIS_PASSWORD_FILE');
 const REDIS_TLS = process.env.REDIS_TLS === '1' || process.env.REDIS_TLS === 'true';
 
 if (!REDIS_URL && !REDIS_HOST) {
-    console.error('[config] FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT).');
+    logger.error('[config] FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT).');
     process.exit(1);
 }
 
@@ -147,7 +161,7 @@ function logStartupConfig(): void {
     } as const;
 
     // Single structured log line for easier ingestion
-    console.log(`[config] ${JSON.stringify(cfg)}`);
+    logger.info(`[config] ${JSON.stringify(cfg)}`);
 }
 
 function acceptsHtml(req: Request): boolean {
@@ -276,13 +290,13 @@ async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
         }
 
         users = raw;
-        console.log(`[users] Loaded ${Object.keys(users).length} users from ${USER_FILE}`);
+        logger.info(`[users] Loaded ${Object.keys(users).length} users from ${USER_FILE}`);
     } catch (error) {
         if (fatal) {
-            console.error(`[users] FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
+            logger.error(`[users] FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
             process.exit(1);
         } else {
-            console.warn(`[users] Reloading users failed; keeping previous users. (${(error as Error).message})`);
+            logger.warn(`[users] Reloading users failed; keeping previous users. (${(error as Error).message})`);
         }
     }
 }
@@ -297,13 +311,13 @@ function validateRedirectUri(uri: string): string {
             return uri;
         }
 
-        console.warn(`[redirect] Blocked potential open redirect to: ${uri}`);
+        logger.warn(`[redirect] Blocked potential open redirect to: ${uri}`);
         return defaultRedirect;
     } catch (error) {
         if (uri.startsWith('/') && !uri.startsWith('//')) {
             return uri;
         }
-        console.warn('[redirect] Invalid redirect URI provided: %s', uri, error);
+        logger.warn('[redirect] Invalid redirect URI provided: %s', uri, error);
         return defaultRedirect;
     }
 }
@@ -379,7 +393,7 @@ class RedisSessionStore implements SessionStore {
                     .zRem(userKey, oldestJti)
                     .exec();
                 count--;
-                console.log(`[sessions] Evicted oldest session for user "${user}" (jti=${oldestJti}) to respect maxSessions=${maxSessions}`);
+                logger.info(`[sessions] Evicted oldest session for user "${user}" (jti=${oldestJti}) to respect maxSessions=${maxSessions}`);
             }
         }
 
@@ -417,7 +431,7 @@ let sessionStore: SessionStore;
 
 const verifyHandler: RequestHandler = async (req, res) => {
     const sourceIp = req.ip;
-    console.log(`[verify] Verifying request from IP: ${sourceIp}`);
+    logger.debug(`[verify] Verifying request from IP: ${sourceIp}`);
 
     try {
         const parsedCookies = cookie.parse(req.headers.cookie ?? '');
@@ -441,10 +455,10 @@ const verifyHandler: RequestHandler = async (req, res) => {
         }
 
         if (!isHostAllowed(requestedHost, userRecord.allowedHosts)) {
-            console.warn(`[verify] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
+            logger.warn(`[verify] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
             if (isDocumentRequest(req)) {
-                const body = '<div class="alert alert--error">Access to this host is not allowed for your account.</div>';
-                res.status(403).set('Cache-Control', 'no-store').send(getPageHTML('Forbidden', body));
+                const body = '<div class="alert alert--error">Zugriff auf diesen Host ist für Ihr Konto nicht erlaubt.</div>';
+                res.status(403).set('Cache-Control', 'no-store').send(getPageHTML('Zugriff verweigert', body));
             } else {
                 res.status(403).set('Cache-Control', 'no-store').end('Forbidden');
             }
@@ -459,7 +473,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
             }
         }
 
-        console.log(`[verify] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
+        logger.debug(`[verify] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
 
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
             res.set('X-Forwarded-User', payload.sub);
@@ -474,7 +488,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         return;
     } catch (error) {
         const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid, expired, or inactive session token';
-        console.warn(`[verify] Verification failed for IP ${sourceIp}: ${reason}`);
+        logger.warn(`[verify] Verification failed for IP ${sourceIp}: ${reason}`);
 
         const originalUrl = getOriginalUrl(req);
 
@@ -501,19 +515,19 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 
     if (req.method === 'POST') {
         if (!isAllowedAuthPost(req as Request)) {
-            console.warn(`[auth] Cross-site POST blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+            logger.warn(`[auth] Cross-site POST blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
             const backLink = `${AUTH_ORIGIN}/auth?redirect_uri=${encodeURIComponent(validatedDestinationUri)}`;
             const body = `
-                <div class="alert alert--error">Invalid request origin. Please use the official login page.</div>
-                <p><a href="${backLink}">Go to login</a></p>
+                <div class="alert alert--error">Ungültige Anfrageherkunft. Bitte verwenden Sie die offizielle Anmeldeseite.</div>
+                <p><a href="${backLink}">Zur Anmeldeseite</a></p>
             `;
-            res.status(403).send(getPageHTML('Forbidden', body));
+            res.status(403).send(getPageHTML('Zugriff verweigert', body));
             return;
         }
 
         const user = req.body.username!;
         const pass = req.body.password!;
-        console.log(`[auth] Login attempt for user "${user}" from IP: ${sourceIp}`);
+        logger.info(`[auth] Login attempt for user "${user}" from IP: ${sourceIp}`);
 
         if (user && pass) {
             const userObject = users[user];
@@ -524,24 +538,24 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             try {
                 const isMatch = await argon2.verify(hashToVerify, pass);
                 if (isMatch && hash) {
-                    console.log(`[auth] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
+                    logger.info(`[auth] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
 
                     const jti = randomUUID();
                     // Register session before issuing the cookie, enforcing max active sessions
                     const allowed = await sessionStore.addSession(user, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
                     if (!allowed) {
-                        console.warn(`[auth] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
-                        const message = '<div class="alert alert--error">Too many active sessions for this account. Please log out on another device and try again.</div>';
+                        logger.warn(`[auth] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
+                        const message = '<div class="alert alert--error">Zu viele aktive Sitzungen für dieses Konto. Bitte melden Sie sich auf einem anderen Gerät ab und versuchen Sie es erneut.</div>';
                         const loginFormBody = `
                             ${message}
                             <form method="post" action="${AUTH_ORIGIN}/auth">
                                 <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-                                <input name="username" placeholder="Username" required autocomplete="username" />
-                                <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
-                                <button type="submit">Login</button>
+                                <input name="username" placeholder="Benutzername" required autocomplete="username" />
+                                <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
+                                <button type="submit">Anmelden</button>
                             </form>
                         `;
-                        res.status(429).send(getPageHTML('Too many sessions', loginFormBody));
+                        res.status(429).send(getPageHTML('Zu viele Sitzungen', loginFormBody));
                         return;
                     }
 
@@ -566,13 +580,13 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     return;
                 }
             } catch (error) {
-                console.error('[auth] Internal error during argon2 verification', error);
-                const body = '<div class="alert alert--error"><strong>Something went wrong.</strong> Please try again later.</div>';
-                res.status(500).send(getPageHTML('Error', body));
+                logger.error('[auth] Internal error during argon2 verification', error);
+                const body = '<div class="alert alert--error"><strong>Es ist ein Fehler aufgetreten.</strong> Bitte versuchen Sie es später erneut.</div>';
+                res.status(500).send(getPageHTML('Fehler', body));
                 return;
             }
         }
-        console.warn(`[auth] FAILED: Authentication attempt from IP: ${sourceIp}`);
+        logger.warn(`[auth] FAILED: Authentication attempt from IP: ${sourceIp}`);
     }
 
     try {
@@ -584,7 +598,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         if (typeof payload.sub === 'string' && typeof payload.jti === 'string') {
             const stillActive = await sessionStore.isActive(payload.sub, payload.jti);
             if (!stillActive) {
-                console.warn('[auth] Inactive session token detected on /auth; clearing cookie and showing login form.');
+                logger.warn('[auth] Inactive session token detected on /auth; clearing cookie and showing login form.');
 
                 const clearCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
                 if (!DOMAIN) delete clearCookieOptions.domain;
@@ -592,53 +606,53 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     cookie.serialize(COOKIE_NAME, '', clearCookieOptions)
                 ]);
 
-                const message = '<div class="alert alert--error">You’ve been signed out on this device because you logged in elsewhere. Please sign in again.</div>';
+                const message = '<div class="alert alert--error">Sie wurden auf diesem Gerät abgemeldet, weil Sie sich an einem anderen Ort angemeldet haben. Bitte melden Sie sich erneut an.</div>';
                 const loginFormBody = `
                     ${message}
                     <form method="post" action="${AUTH_ORIGIN}/auth">
                         <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-                        <input name="username" placeholder="Username" required autocomplete="username" />
-                        <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
-                        <button type="submit">Login</button>
+                        <input name="username" placeholder="Benutzername" required autocomplete="username" />
+                        <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
+                        <button type="submit">Anmelden</button>
                     </form>
                 `;
-                res.status(401).send(getPageHTML('Login', loginFormBody));
+                res.status(401).send(getPageHTML('Anmeldung', loginFormBody));
                 return;
             }
         }
 
         const loggedInBody = `
-            <h1>Authenticated</h1>
-            <p>You are successfully authenticated and can access other protected services.</p>
-            <p><a href="${safeDestinationUri}">Go back to original destination</a> or <a href="/logout">Logout</a></p>
+            <h1>Angemeldet</h1>
+            <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
+            <p><a href="${safeDestinationUri}">Zur ursprünglichen Seite</a> oder <a href="/logout">Abmelden</a></p>
         `;
-        res.status(200).send(getPageHTML('Authenticated', loggedInBody));
+        res.status(200).send(getPageHTML('Angemeldet', loggedInBody));
         return;
     } catch {
-        console.warn('[auth] JWT verification not present/failed (likely not logged in).');
+        logger.warn('[auth] JWT verification not present/failed (likely not logged in).');
 
         const loginMessage = req.method === 'POST'
-            ? '<div class="alert alert--error">Invalid username or password.</div><h1>Please Login</h1>'
-            : '<h1>Please Login</h1>';
+            ? '<div class="alert alert--error">Ungültiger Benutzername oder Passwort.</div><h1>Bitte anmelden</h1>'
+            : '<h1>Bitte anmelden</h1>';
 
         const loginFormBody = `
             ${loginMessage}
             <form method="post" action="${AUTH_ORIGIN}/auth">
                 <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-                <input name="username" placeholder="Username" required autocomplete="username" />
-                <input name="password" type="password" placeholder="Password" required autocomplete="current-password" />
-                <button type="submit">Login</button>
+                <input name="username" placeholder="Benutzername" required autocomplete="username" />
+                <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
+                <button type="submit">Anmelden</button>
             </form>
         `;
 
-        res.status(401).send(getPageHTML('Login', loginFormBody));
+        res.status(401).send(getPageHTML('Anmeldung', loginFormBody));
     }
 };
 
 const logoutHandler: RequestHandler = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
-    console.log(`[logout] User logged out from IP: ${req.ip}`);
+    logger.info(`[logout] User logged out from IP: ${req.ip}`);
 
     const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
     if (!DOMAIN) delete sessionCookieOptions.domain;
@@ -662,11 +676,11 @@ const logoutHandler: RequestHandler = async (req, res) => {
     ]);
 
     const logoutBody = `
-        <h1>Logged Out</h1>
-        <p>You have been successfully logged out.</p>
-        <a href="/">Login again</a>
+        <h1>Abgemeldet</h1>
+        <p>Sie wurden erfolgreich abgemeldet.</p>
+        <a href="/">Erneut anmelden</a>
     `;
-    res.status(200).send(getPageHTML('Logged Out', logoutBody));
+    res.status(200).send(getPageHTML('Abgemeldet', logoutBody));
 };
 
 void (async () => {
@@ -679,9 +693,9 @@ void (async () => {
         // Connect to Redis (required)
         try {
             await redisClient.connect();
-            console.log('[redis] Connected to Redis');
+            logger.info('[redis] Connected to Redis');
         } catch (error) {
-            console.error('[redis] FATAL: Failed to connect to Redis.', error);
+            logger.error('[redis] FATAL: Failed to connect to Redis.', error);
             process.exit(1);
         }
 
@@ -697,7 +711,7 @@ void (async () => {
             limit: LOGIN_LIMITER_MAX,
             standardHeaders: true,
             legacyHeaders: false,
-            message: 'Too many login attempts from this IP, please try again after 15 minutes',
+            message: 'Zu viele Anmeldeversuche von dieser IP. Bitte versuchen Sie es in 15 Minuten erneut.',
             store: loginStore,
         });
         verifyLimiter = rateLimit({
@@ -705,7 +719,7 @@ void (async () => {
             limit: VERIFY_LIMITER_MAX,
             standardHeaders: true,
             legacyHeaders: false,
-            message: 'Too many requests from this IP, please try again later',
+            message: 'Zu viele Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
             store: verifyStore,
         });
         authPageLimiter = rateLimit({
@@ -713,13 +727,13 @@ void (async () => {
             limit: AUTH_PAGE_LIMITER_MAX,
             standardHeaders: true,
             legacyHeaders: false,
-            message: 'Too many requests from this IP, please try again later',
+            message: 'Zu viele Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
             store: authPageStore,
         });
 
         // Initialize session store (Redis only)
         sessionStore = new RedisSessionStore(redisClient);
-        console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: last-login-wins`);
+        logger.info(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: last-login-wins`);
 
         // Register routes after limiters are ready
         app.get('/', (req, res) => {
@@ -735,25 +749,25 @@ void (async () => {
         // Poll for changes in users.json and reload on modifications
         watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
             if (curr.mtimeMs !== prev.mtimeMs) {
-                console.log(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
+                logger.info(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
                 void loadUsers({ fatal: false });
             }
         });
 
         process.on('SIGHUP', () => {
-            console.log('[users] SIGHUP received. Reloading users...');
+            logger.info('[users] SIGHUP received. Reloading users...');
             void loadUsers({ fatal: false });
         });
     } catch (error) {
-        console.warn('[users] Failed to initialize watch/polling for users file.', error);
+        logger.warn('[users] Failed to initialize watch/polling for users file.', error);
     }
 
     app.listen(PORT, () => {
-        console.log(`[server] ForwardAuth listening on port ${PORT}`);
+        logger.info(`[server] ForwardAuth listening on port ${PORT}`);
         if (!DOMAIN) {
-            console.warn('[config] DOMAIN is not set. Cookies may not work across subdomains.');
+            logger.warn('[config] DOMAIN is not set. Cookies may not work across subdomains.');
         } else {
-            console.log(`[config] Cookies will be set for domain: ${DOMAIN}`);
+            logger.info(`[config] Cookies will be set for domain: ${DOMAIN}`);
         }
     })
 })();

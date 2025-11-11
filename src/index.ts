@@ -74,7 +74,7 @@ function getEnvSecret(key: string, fileKey: string): string | undefined {
     return process.env[key];
 }
 
-// Optional Redis-backed rate limiting for multi-instance deployments
+// Redis (REQUIRED) for rate limiting and sessions
 const REDIS_URL = process.env.REDIS_URL;
 const REDIS_HOST = process.env.REDIS_HOST;
 const REDIS_PORT = getEnvAsNumber('REDIS_PORT', 6379);
@@ -82,21 +82,22 @@ const REDIS_USERNAME = process.env.REDIS_USERNAME;
 const REDIS_PASSWORD = getEnvSecret('REDIS_PASSWORD', 'REDIS_PASSWORD_FILE');
 const REDIS_TLS = process.env.REDIS_TLS === '1' || process.env.REDIS_TLS === 'true';
 
-const USE_REDIS_RATE_LIMIT = Boolean(REDIS_URL ?? REDIS_HOST);
+if (!REDIS_URL && !REDIS_HOST) {
+    console.error('FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT).');
+    process.exit(1);
+}
 
-let redisClient: RedisClientType | undefined;
-let loginStore: RateLimitStore | undefined;
-let verifyStore: RateLimitStore | undefined;
-let authPageStore: RateLimitStore | undefined;
+let redisClient: RedisClientType;
+let loginStore: RateLimitStore;
+let verifyStore: RateLimitStore;
+let authPageStore: RateLimitStore;
 
-if (USE_REDIS_RATE_LIMIT) {
-    if (REDIS_URL) {
-        redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD });
-    } else if (REDIS_HOST) {
-        const proto = REDIS_TLS ? 'rediss' : 'redis';
-        const url = `${proto}://${REDIS_HOST}:${REDIS_PORT}`;
-        redisClient = createClient({ url, username: REDIS_USERNAME, password: REDIS_PASSWORD });
-    }
+if (REDIS_URL) {
+    redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD });
+} else {
+    const proto = REDIS_TLS ? 'rediss' : 'redis';
+    const url = `${proto}://${REDIS_HOST}:${REDIS_PORT}`;
+    redisClient = createClient({ url, username: REDIS_USERNAME, password: REDIS_PASSWORD });
 }
 
 function acceptsHtml(req: Request): boolean {
@@ -346,54 +347,7 @@ class RedisSessionStore implements SessionStore {
     }
 }
 
-class MemorySessionStore implements SessionStore {
-    // user -> jti -> { createdAt, expiresAt }
-    private readonly sessions = new Map<string, Map<string, { createdAt: number; expiresAt: number }>>();
-
-    private prune(user: string) {
-        const map = this.sessions.get(user);
-        if (!map) return;
-        const now = Date.now();
-        for (const [jti, meta] of map) {
-            if (meta.expiresAt <= now) {
-                map.delete(jti);
-            }
-        }
-        if (map.size === 0) this.sessions.delete(user);
-    }
-
-    addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number): Promise<boolean> {
-        const now = Date.now();
-        const expiresAt = now + ttlSeconds * 1000;
-        const map = this.sessions.get(user) ?? new Map<string, { createdAt: number; expiresAt: number }>();
-        this.sessions.set(user, map);
-
-        this.prune(user);
-
-        if (map.size >= maxSessions) {
-            return Promise.resolve(false);
-        }
-
-        map.set(jti, { createdAt: now, expiresAt });
-
-        return Promise.resolve(true);
-    }
-
-    isActive(user: string, jti: string): Promise<boolean> {
-        if (!jti) return Promise.resolve(false);
-        this.prune(user);
-        const map = this.sessions.get(user);
-        return Promise.resolve(map?.has(jti) ?? false);
-    }
-
-    removeSession(user: string, jti: string): Promise<void> {
-        const map = this.sessions.get(user);
-        if (!map) return Promise.resolve();
-        map.delete(jti);
-        if (map.size === 0) this.sessions.delete(user);
-        return Promise.resolve();
-    }
-}
+// In-memory session store removed; Redis is mandatory.
 
 let sessionStore: SessionStore;
 
@@ -644,32 +598,29 @@ void (async () => {
     await loadUsers();
 
     try {
-        if (USE_REDIS_RATE_LIMIT && redisClient) {
-            try {
-                await redisClient.connect();
-                console.log('[rate-limit] Connected to Redis for rate limiting');
-            } catch (error) {
-                console.error('[rate-limit] FATAL: Failed to connect to Redis for rate limiting.', error);
-                process.exit(1);
-            }
+        // Connect to Redis (required)
+        try {
+            await redisClient.connect();
+            console.log('[redis] Connected to Redis');
+        } catch (error) {
+            console.error('[redis] FATAL: Failed to connect to Redis.', error);
+            process.exit(1);
         }
 
         // Create Redis-backed stores once connected
-        if (USE_REDIS_RATE_LIMIT && redisClient) {
-            const sendCommand = (...args: string[]): Promise<RedisReply> => redisClient.sendCommand(args);
-            loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
-            verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
-            authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
-        }
+        const sendCommand = (...args: string[]): Promise<RedisReply> => redisClient.sendCommand(args);
+        loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
+        verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
+        authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
 
-        // Initialize rate limiters (with or without Redis store)
+        // Initialize rate limiters with Redis store
         loginLimiter = rateLimit({
             windowMs: LOGIN_LIMITER_WINDOW_S * 1000,
             limit: LOGIN_LIMITER_MAX,
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Too many login attempts from this IP, please try again after 15 minutes',
-            ...(loginStore ? { store: loginStore } : {}),
+            store: loginStore,
         });
         verifyLimiter = rateLimit({
             windowMs: VERIFY_LIMITER_WINDOW_S * 1000,
@@ -677,7 +628,7 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Too many requests from this IP, please try again later',
-            ...(verifyStore ? { store: verifyStore } : {}),
+            store: verifyStore,
         });
         authPageLimiter = rateLimit({
             windowMs: AUTH_PAGE_LIMITER_WINDOW_S * 1000,
@@ -685,17 +636,12 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Too many requests from this IP, please try again later',
-            ...(authPageStore ? { store: authPageStore } : {}),
+            store: authPageStore,
         });
 
-        // Initialize session store (Redis if configured; memory otherwise)
-        if (redisClient) {
-            sessionStore = new RedisSessionStore(redisClient);
-            console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: reject`);
-        } else {
-            sessionStore = new MemorySessionStore();
-            console.log(`[sessions] Using in-memory session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: reject`);
-        }
+        // Initialize session store (Redis only)
+        sessionStore = new RedisSessionStore(redisClient);
+        console.log(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: reject`);
 
         // Register routes after limiters are ready
         app.get('/', (req, res) => {

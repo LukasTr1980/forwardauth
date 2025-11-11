@@ -58,6 +58,8 @@ const DOMAIN_WILDCARD = DOMAIN ? `https://*.${DOMAIN}` : undefined;
 const ROOT_DOMAIN = DOMAIN ? `https://${DOMAIN}` : undefined;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3000/auth';
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
+// Brand name used in simple page layout: prefer cookie domain, else login host
+const BRAND_NAME = DOMAIN ?? new URL(LOGIN_REDIRECT_URL).hostname;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
@@ -324,6 +326,7 @@ const getPageHTML = (title: string, body: string): string => `
     </head>
     <body>
         <div class="container">
+            <div class="brand">${he.encode(BRAND_NAME)}</div>
             ${body}
         </div>
     </body>
@@ -439,7 +442,12 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         if (!isHostAllowed(requestedHost, userRecord.allowedHosts)) {
             console.warn(`[verify] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
-            res.status(403).set('Cache-Control', 'no-store').end('Forbidden');
+            if (isDocumentRequest(req)) {
+                const body = '<div class="alert alert--error">Access to this host is not allowed for your account.</div>';
+                res.status(403).set('Cache-Control', 'no-store').send(getPageHTML('Forbidden', body));
+            } else {
+                res.status(403).set('Cache-Control', 'no-store').end('Forbidden');
+            }
             return;
         }
 
@@ -494,7 +502,12 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     if (req.method === 'POST') {
         if (!isAllowedAuthPost(req as Request)) {
             console.warn(`[auth] Cross-site POST blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
-            res.status(403).send(getPageHTML('Error', '<h1>Forbidden</h1><p>Invalid request origin.</p>'));
+            const backLink = `${AUTH_ORIGIN}/auth?redirect_uri=${encodeURIComponent(validatedDestinationUri)}`;
+            const body = `
+                <div class="alert alert--error">Invalid request origin. Please use the official login page.</div>
+                <p><a href="${backLink}">Go to login</a></p>
+            `;
+            res.status(403).send(getPageHTML('Forbidden', body));
             return;
         }
 
@@ -518,7 +531,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     const allowed = await sessionStore.addSession(user, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
                     if (!allowed) {
                         console.warn(`[auth] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
-                        const message = '<h1 class="login-error">Too many active sessions for this account. Please log out on another device and try again.</h1>';
+                        const message = '<div class="alert alert--error">Too many active sessions for this account. Please log out on another device and try again.</div>';
                         const loginFormBody = `
                             ${message}
                             <form method="post" action="${AUTH_ORIGIN}/auth">
@@ -554,7 +567,8 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                 }
             } catch (error) {
                 console.error('[auth] Internal error during argon2 verification', error);
-                res.status(500).send(getPageHTML('Error', '<h1>Internal Server Error</h1><p>An unexpected error occurred. Please try again later.</p>'));
+                const body = '<div class="alert alert--error"><strong>Something went wrong.</strong> Please try again later.</div>';
+                res.status(500).send(getPageHTML('Error', body));
                 return;
             }
         }
@@ -578,7 +592,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     cookie.serialize(COOKIE_NAME, '', clearCookieOptions)
                 ]);
 
-                const message = '<h1 class="login-error">You have been signed out on this device because you logged in elsewhere. Please login again.</h1>';
+                const message = '<div class="alert alert--error">You’ve been signed out on this device because you logged in elsewhere. Please sign in again.</div>';
                 const loginFormBody = `
                     ${message}
                     <form method="post" action="${AUTH_ORIGIN}/auth">
@@ -604,7 +618,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         console.warn('[auth] JWT verification not present/failed (likely not logged in).');
 
         const loginMessage = req.method === 'POST'
-            ? '<h1 class="login-error">Invalid username or password!</h1>'
+            ? '<div class="alert alert--error">Invalid username or password.</div><h1>Please Login</h1>'
             : '<h1>Please Login</h1>';
 
         const loginFormBody = `

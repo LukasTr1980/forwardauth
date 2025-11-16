@@ -305,19 +305,27 @@ function validateRedirectUri(uri: string): string {
     const defaultRedirect = '/';
     if (!uri) return defaultRedirect;
 
+    const trimmed = uri.trim();
+
     try {
-        const url = new URL(uri);
-        if (DOMAIN && (url.hostname === DOMAIN || url.hostname.endsWith(`.${DOMAIN}`))) {
-            return uri;
+        const url = new URL(trimmed);
+
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            logger.warn('[redirect] Blocked non-http(s) redirect to: %s', trimmed);
+            return defaultRedirect;
         }
 
-        logger.warn(`[redirect] Blocked potential open redirect to: ${uri}`);
+        if (DOMAIN && (url.hostname === DOMAIN || url.hostname.endsWith(`.${DOMAIN}`))) {
+            return url.toString();
+        }
+
+        logger.warn('[redirect] Blocked potential open redirect to: %s', trimmed);
         return defaultRedirect;
     } catch (error) {
-        if (uri.startsWith('/') && !uri.startsWith('//')) {
-            return uri;
+        if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
+            return trimmed;
         }
-        logger.warn('[redirect] Invalid redirect URI provided: %s', uri, error);
+        logger.warn('[redirect] Invalid redirect URI provided: %s', trimmed, error);
         return defaultRedirect;
     }
 }

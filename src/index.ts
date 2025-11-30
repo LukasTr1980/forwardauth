@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 interface User {
     hash: string;
     allowedHosts?: string[];
+    isAdult?: boolean;
 }
 
 interface LoginQuery {
@@ -243,6 +244,10 @@ function isRecordOfUser(data: unknown): data is Record<string, User> {
                 (
                     (u as User).allowedHosts === undefined ||
                     isStringArray((u as User).allowedHosts)
+                ) &&
+                (
+                    (u as User).isAdult === undefined ||
+                    typeof (u as User).isAdult === 'boolean'
                 )
         )
     );
@@ -470,6 +475,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
             throw new Error('User not found');
         }
 
+        const userIsAdult = userRecord.isAdult === true;
+
         const requestedHost = req.header('X-Forwarded-Host') ?? req.hostname;
         if (!requestedHost) {
             throw new Error('Host header missing');
@@ -498,6 +505,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
             res.set('X-Forwarded-User', payload.sub);
+            res.set('X-Forwarded-Is-Adult', userIsAdult ? '1' : '0');
             res.sendStatus(200);
             return;
         }
@@ -505,6 +513,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         // Removed banner redirect logic to prevent redirect loops
 
         res.set('X-Forwarded-User', payload.sub);
+        res.set('X-Forwarded-Is-Adult', userIsAdult ? '1' : '0');
         res.sendStatus(200);
         return;
     } catch (error) {

@@ -35,6 +35,17 @@ function getEnvAsNumber(key: string, defaultValue: number): number {
     return Number.isFinite(value) ? value : defaultValue;
 }
 
+function parseCsvList(value?: string): string[] {
+    if (!value) return [];
+    return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizePathPrefix(prefix: string): string {
+    if (!prefix) return '';
+    if (!prefix.startsWith('/')) return `/${prefix}`;
+    return prefix;
+}
+
 // Simple log level gate: LOG_LEVEL=debug|info|warn|error|silent (default: info)
 type LogLevelName = 'debug' | 'info' | 'warn' | 'error' | 'silent';
 const LOG_LEVEL_ENV = (process.env.LOG_LEVEL ?? 'info').toLowerCase() as LogLevelName;
@@ -79,6 +90,7 @@ const BRAND_NAME = DOMAIN ?? new URL(LOGIN_REDIRECT_URL).hostname;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
+const ADULT_PATH_PREFIXES = parseCsvList(process.env.ADULT_PATH_PREFIXES).map(normalizePathPrefix).filter(Boolean);
 
 
 function getEnvSecret(key: string, fileKey: string): string | undefined {
@@ -153,6 +165,9 @@ function logStartupConfig(): void {
         users: {
             file: USER_FILE,
             watchIntervalMs: USER_FILE_WATCH_INTERVAL_MS,
+        },
+        adult: {
+            pathPrefixes: ADULT_PATH_PREFIXES,
         },
         redis: REDIS_URL
             ? { mode: 'url', url: sanitizeRedisUrl(REDIS_URL), tls: REDIS_TLS }
@@ -285,6 +300,27 @@ function isHostAllowed(host: string, allowedHosts?: string[]): boolean {
 
         return normalizedHost === normalizedAllowed;
     });
+}
+
+function getPathFromUri(uri: string): string {
+    if (!uri) return '/';
+    const trimmed = uri.trim();
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+        try {
+            return new URL(trimmed).pathname || '/';
+        } catch {
+            // ignore parse errors and fall back below
+        }
+    }
+    const pathOnly = trimmed.split('?')[0] ?? '/';
+    if (!pathOnly.startsWith('/')) return `/${pathOnly}`;
+    return pathOnly || '/';
+}
+
+function isAdultPath(uri: string): boolean {
+    if (ADULT_PATH_PREFIXES.length === 0) return false;
+    const path = getPathFromUri(uri);
+    return ADULT_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
 async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
@@ -475,8 +511,6 @@ const verifyHandler: RequestHandler = async (req, res) => {
             throw new Error('User not found');
         }
 
-        const userIsAdult = userRecord.isAdult === true;
-
         const requestedHost = req.header('X-Forwarded-Host') ?? req.hostname;
         if (!requestedHost) {
             throw new Error('Host header missing');
@@ -486,6 +520,21 @@ const verifyHandler: RequestHandler = async (req, res) => {
             logger.warn(`[verify] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
             if (isDocumentRequest(req)) {
                 const body = '<div class="alert alert--error">Zugriff auf diesen Host ist für Ihr Konto nicht erlaubt.</div>';
+                res.status(403).set('Cache-Control', 'no-store').send(getPageHTML('Zugriff verweigert', body));
+            } else {
+                res.status(403).set('Cache-Control', 'no-store').end('Forbidden');
+            }
+            return;
+        }
+
+        const requestedUri = req.header('X-Forwarded-Uri') ?? req.originalUrl ?? '/';
+        const adultContentRequested = isAdultPath(requestedUri);
+        const userIsAdult = userRecord.isAdult === true;
+
+        if (adultContentRequested && !userIsAdult) {
+            logger.warn(`[verify] Adult content blocked for user "${payload.sub}" from IP ${sourceIp} on uri ${requestedUri}`);
+            if (isDocumentRequest(req)) {
+                const body = '<div class="alert alert--error">Dieser Inhalt ist nur für volljährige Nutzerinnen und Nutzer freigeschaltet.</div>';
                 res.status(403).set('Cache-Control', 'no-store').send(getPageHTML('Zugriff verweigert', body));
             } else {
                 res.status(403).set('Cache-Control', 'no-store').end('Forbidden');

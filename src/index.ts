@@ -529,7 +529,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         const requestedUri = req.header('X-Forwarded-Uri') ?? req.originalUrl ?? '/';
         const adultContentRequested = isAdultPath(requestedUri);
-        const userIsAdult = userRecord.isAdult === true;
+        // Trust primary flag from users.json; allow a signed token claim as additive truthy signal
+        const userIsAdult = userRecord.isAdult === true || payload.isAdult === true;
 
         if (adultContentRequested && !userIsAdult) {
             logger.warn(`[verify] Adult content blocked for user "${payload.sub}" from IP ${sourceIp} on uri ${requestedUri}`);
@@ -798,7 +799,9 @@ const appTokenHandler: RequestHandler = async (req, res) => {
 
         const userId = payload.sub;
 
-        const appJwt = await new SignJWT({ type: 'app' })
+        const userIsAdult = users[userId]?.isAdult === true;
+
+        const appJwt = await new SignJWT({ type: 'app', isAdult: userIsAdult })
             .setProtectedHeader({ alg: 'HS256' })
             .setIssuer(JWT_ISSUER)
             .setSubject(userId)

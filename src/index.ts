@@ -18,6 +18,7 @@ interface User {
     hash: string;
     allowedHosts?: string[];
     isAdult?: boolean;
+    isAdmin?: boolean;
 }
 
 interface LoginQuery {
@@ -112,6 +113,8 @@ const REDIS_PORT = getEnvAsNumber('REDIS_PORT', 6379);
 const REDIS_USERNAME = process.env.REDIS_USERNAME;
 const REDIS_PASSWORD = getEnvSecret('REDIS_PASSWORD', 'REDIS_PASSWORD_FILE');
 const REDIS_TLS = process.env.REDIS_TLS === '1' || process.env.REDIS_TLS === 'true';
+const ADMIN_API_TOKEN = getEnvSecret('ADMIN_API_TOKEN', 'ADMIN_API_TOKEN_FILE');
+const LAST_SEEN_REDIS_KEY = 'user:lastseen';
 
 if (!REDIS_URL && !REDIS_HOST) {
     logger.error('[config] FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT).');
@@ -172,10 +175,14 @@ function logStartupConfig(): void {
         redis: REDIS_URL
             ? { mode: 'url', url: sanitizeRedisUrl(REDIS_URL), tls: REDIS_TLS }
             : { mode: 'host', host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
+        adminApi: {
+            lastSeen: ADMIN_API_TOKEN ? 'token+session' : 'session-only',
+        },
         secrets: {
             jwtSecret: secretEnv ? 'set' : 'unset',
             redisPassword: REDIS_PASSWORD ? 'set' : 'unset',
             redisUsername: REDIS_USERNAME ? 'set' : 'unset',
+            adminApiToken: ADMIN_API_TOKEN ? 'set' : 'unset',
         },
     } as const;
 
@@ -263,6 +270,10 @@ function isRecordOfUser(data: unknown): data is Record<string, User> {
                 (
                     (u as User).isAdult === undefined ||
                     typeof (u as User).isAdult === 'boolean'
+                ) &&
+                (
+                    (u as User).isAdmin === undefined ||
+                    typeof (u as User).isAdmin === 'boolean'
                 )
         )
     );
@@ -481,8 +492,125 @@ class RedisSessionStore implements SessionStore {
 
 let sessionStore: SessionStore;
 
+// -----------------------------
+// Last-seen tracking (Redis-backed)
+// -----------------------------
+
+type LastSeenSource = 'login' | 'verify';
+
+interface LastSeenPayload {
+    at: number;
+    ip: string;
+    host: string;
+    uri?: string;
+    userAgent: string;
+    platform?: string;
+    via: LastSeenSource;
+    jti?: string;
+}
+
+interface LastSeenRecord extends LastSeenPayload {
+    user: string;
+}
+
+function parseLastSeenPayload(raw: string): LastSeenPayload | null {
+    try {
+        const parsed = JSON.parse(raw) as Partial<LastSeenPayload>;
+        if (
+            typeof parsed.at === 'number' &&
+            typeof parsed.ip === 'string' &&
+            typeof parsed.host === 'string' &&
+            typeof parsed.userAgent === 'string' &&
+            (parsed.via === 'login' || parsed.via === 'verify')
+        ) {
+            return {
+                at: parsed.at,
+                ip: parsed.ip,
+                host: parsed.host,
+                uri: typeof parsed.uri === 'string' ? parsed.uri : undefined,
+                userAgent: parsed.userAgent,
+                platform: typeof parsed.platform === 'string' ? parsed.platform : undefined,
+                via: parsed.via,
+                jti: typeof parsed.jti === 'string' ? parsed.jti : undefined,
+            };
+        }
+    } catch {
+        // ignore invalid JSON
+    }
+    return null;
+}
+
+async function recordLastSeen(user: string, payload: Omit<LastSeenPayload, 'at'>): Promise<void> {
+    const entry: LastSeenPayload = {
+        ...payload,
+        at: Date.now(),
+    };
+    try {
+        await redisClient.hSet(LAST_SEEN_REDIS_KEY, user, JSON.stringify(entry));
+    } catch (error) {
+        logger.warn(`[lastseen] Failed to store last-seen for "${user}":`, error);
+    }
+}
+
+async function fetchLastSeen(): Promise<LastSeenRecord[]> {
+    try {
+        const rawMap = await redisClient.hGetAll(LAST_SEEN_REDIS_KEY);
+        const records = Object.entries(rawMap)
+            .map(([user, raw]) => {
+                const parsed = parseLastSeenPayload(raw);
+                if (!parsed) return null;
+                return { user, ...parsed };
+            })
+            .filter((entry): entry is LastSeenRecord => entry !== null)
+            .sort((a, b) => b.at - a.at);
+        return records;
+    } catch (error) {
+        logger.error('[lastseen] Failed to fetch last-seen data from Redis', error);
+        return [];
+    }
+}
+
+async function authenticateAdmin(req: Request): Promise<string | null> {
+    // Prefer session-based admin auth so specific users (e.g., "lukas") can access without a static token.
+    const cookies = cookie.parse(req.headers.cookie ?? '');
+    const sessionToken = cookies[COOKIE_NAME];
+    if (sessionToken) {
+        try {
+            const { payload } = await jwtVerify(sessionToken, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+            if (typeof payload.sub === 'string') {
+                const user = users[payload.sub];
+                if (user?.isAdmin) {
+                    if (typeof payload.jti === 'string') {
+                        const active = await sessionStore.isActive(payload.sub, payload.jti);
+                        if (!active) return null;
+                    }
+                    return payload.sub;
+                }
+            }
+        } catch {
+            // fall through to token-based auth
+        }
+    }
+
+    if (!ADMIN_API_TOKEN) return null;
+
+    const authHeader = getHeaderString(req, 'authorization');
+    const bearerPrefix = 'bearer ';
+    if (authHeader.toLowerCase().startsWith(bearerPrefix)) {
+        const token = authHeader.slice(bearerPrefix.length).trim();
+        if (token === ADMIN_API_TOKEN) {
+            return 'admin-api-token';
+        }
+    }
+
+    return null;
+}
+
 const verifyHandler: RequestHandler = async (req, res) => {
-    const sourceIp = req.ip;
+    const sourceIp = req.ip ?? 'unknown';
+    const userAgent = getHeaderString(req, 'user-agent') || 'unknown';
+    const platformHeader = getHeaderString(req, 'sec-ch-ua-platform');
+    const platform = platformHeader || undefined;
     logger.debug(`[verify] Verifying request from IP: ${sourceIp}`);
 
     try {
@@ -553,6 +681,16 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         logger.debug(`[verify] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
 
+        void recordLastSeen(payload.sub, {
+            ip: sourceIp,
+            host: requestedHost,
+            uri: requestedUri,
+            userAgent,
+            platform,
+            via: 'verify',
+            jti: typeof payload.jti === 'string' ? payload.jti : undefined,
+        });
+
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
             res.set('X-Forwarded-User', payload.sub);
             res.set('X-Forwarded-Is-Adult', userIsAdult ? '1' : '0');
@@ -586,12 +724,16 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     res.setHeader('Cache-Control', 'no-store');
 
     const cookies = cookie.parse(req.headers.cookie ?? '');
+    const userAgent = getHeaderString(req as Request, 'user-agent') || 'unknown';
+    const platformHeader = getHeaderString(req as Request, 'sec-ch-ua-platform');
+    const platform = platformHeader || undefined;
+    const requestHost = req.header('X-Forwarded-Host') ?? req.hostname;
 
     const rawRedirectUri = req.query.redirect_uri ?? req.body?.redirect_uri;
     const validatedDestinationUri = validateRedirectUri(rawRedirectUri ?? getOriginalUrl(req as Request));
     const safeDestinationUri = he.encode(validatedDestinationUri);
 
-    const sourceIp = req.ip;
+    const sourceIp = req.ip ?? 'unknown';
 
     if (req.method === 'POST') {
         if (!isAllowedAuthPost(req as Request)) {
@@ -655,6 +797,17 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     res.setHeader('Set-Cookie', [
                         cookie.serialize(COOKIE_NAME, jwt, sessionCookieOptions)
                     ]);
+
+                    const lastSeenHost = requestHost || req.hostname || 'unknown';
+                    void recordLastSeen(user, {
+                        ip: sourceIp,
+                        host: lastSeenHost,
+                        uri: validatedDestinationUri,
+                        userAgent,
+                        platform,
+                        via: 'login',
+                        jti,
+                    });
 
                     res.redirect(validatedDestinationUri);
                     return;
@@ -817,6 +970,21 @@ const appTokenHandler: RequestHandler = async (req, res) => {
     }
 };
 
+const adminLastSeenHandler: RequestHandler = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const adminUser = await authenticateAdmin(req);
+    if (!adminUser) {
+        logger.warn(`[admin] Unauthorized last-seen access attempt from IP: ${req.ip}`);
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+    }
+
+    const entries = await fetchLastSeen();
+    logger.info(`[admin] Last-seen report requested by "${adminUser}" from IP ${req.ip}; ${entries.length} entries returned`);
+    res.status(200).json({ entries });
+};
+
 void (async () => {
     await loadUsers();
 
@@ -878,6 +1046,10 @@ void (async () => {
         app.get('/logout', logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);
         app.post('/auth/app-token', verifyLimiter, appTokenHandler);
+        app.get('/admin/last-seen', adminLastSeenHandler);
+        logger.info(ADMIN_API_TOKEN
+            ? '[admin] /admin/last-seen enabled (admin session or static token accepted)'
+            : '[admin] /admin/last-seen enabled (admin session required)');
 
         // Removed /still-logged route
 

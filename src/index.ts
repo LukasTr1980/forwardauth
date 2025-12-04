@@ -113,7 +113,6 @@ const REDIS_PORT = getEnvAsNumber('REDIS_PORT', 6379);
 const REDIS_USERNAME = process.env.REDIS_USERNAME;
 const REDIS_PASSWORD = getEnvSecret('REDIS_PASSWORD', 'REDIS_PASSWORD_FILE');
 const REDIS_TLS = process.env.REDIS_TLS === '1' || process.env.REDIS_TLS === 'true';
-const ADMIN_API_TOKEN = getEnvSecret('ADMIN_API_TOKEN', 'ADMIN_API_TOKEN_FILE');
 const LAST_SEEN_REDIS_KEY = 'user:lastseen';
 
 if (!REDIS_URL && !REDIS_HOST) {
@@ -175,14 +174,10 @@ function logStartupConfig(): void {
         redis: REDIS_URL
             ? { mode: 'url', url: sanitizeRedisUrl(REDIS_URL), tls: REDIS_TLS }
             : { mode: 'host', host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
-        adminApi: {
-            lastSeen: ADMIN_API_TOKEN ? 'token+session' : 'session-only',
-        },
         secrets: {
             jwtSecret: secretEnv ? 'set' : 'unset',
             redisPassword: REDIS_PASSWORD ? 'set' : 'unset',
             redisUsername: REDIS_USERNAME ? 'set' : 'unset',
-            adminApiToken: ADMIN_API_TOKEN ? 'set' : 'unset',
         },
     } as const;
 
@@ -392,7 +387,9 @@ function getOriginalUrl(req: Request): string {
     return `${proto}://${host}${uri}`;
 }
 
-const getPageHTML = (title: string, body: string): string => `
+const getPageHTML = (title: string, body: string, options: { containerClass?: string } = {}): string => {
+    const containerClass = options.containerClass ? `container ${options.containerClass}` : 'container';
+    return `
     <!doctype html>
     <html lang="en">
     <head>
@@ -402,13 +399,14 @@ const getPageHTML = (title: string, body: string): string => `
         <link rel="stylesheet" href="/styles.css">
     </head>
     <body>
-        <div class="container">
+        <div class="${containerClass}">
             <div class="brand">${he.encode(BRAND_NAME)}</div>
             ${body}
         </div>
     </body>
     </html>
-`;
+    `;
+};
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static('public'));
@@ -513,6 +511,15 @@ interface LastSeenRecord extends LastSeenPayload {
     user: string;
 }
 
+function formatTimestamp(ms: number): string {
+    const date = new Date(ms);
+    if (Number.isNaN(date.getTime())) return '–';
+    return new Intl.DateTimeFormat('de-DE', {
+        dateStyle: 'medium',
+        timeStyle: 'medium',
+    }).format(date);
+}
+
 function parseLastSeenPayload(raw: string): LastSeenPayload | null {
     try {
         const parsed = JSON.parse(raw) as Partial<LastSeenPayload>;
@@ -571,7 +578,6 @@ async function fetchLastSeen(): Promise<LastSeenRecord[]> {
 }
 
 async function authenticateAdmin(req: Request): Promise<string | null> {
-    // Prefer session-based admin auth so specific users (e.g., "lukas") can access without a static token.
     const cookies = cookie.parse(req.headers.cookie ?? '');
     const sessionToken = cookies[COOKIE_NAME];
     if (sessionToken) {
@@ -591,18 +597,6 @@ async function authenticateAdmin(req: Request): Promise<string | null> {
             // fall through to token-based auth
         }
     }
-
-    if (!ADMIN_API_TOKEN) return null;
-
-    const authHeader = getHeaderString(req, 'authorization');
-    const bearerPrefix = 'bearer ';
-    if (authHeader.toLowerCase().startsWith(bearerPrefix)) {
-        const token = authHeader.slice(bearerPrefix.length).trim();
-        if (token === ADMIN_API_TOKEN) {
-            return 'admin-api-token';
-        }
-    }
-
     return null;
 }
 
@@ -976,13 +970,64 @@ const adminLastSeenHandler: RequestHandler = async (req, res) => {
     const adminUser = await authenticateAdmin(req);
     if (!adminUser) {
         logger.warn(`[admin] Unauthorized last-seen access attempt from IP: ${req.ip}`);
-        res.status(401).json({ error: 'unauthorized' });
+        const body = '<div class="alert alert--error">Zugriff verweigert. Bitte als Admin anmelden.</div>';
+        res.status(401).send(getPageHTML('Zugriff verweigert', body));
         return;
     }
 
     const entries = await fetchLastSeen();
     logger.info(`[admin] Last-seen report requested by "${adminUser}" from IP ${req.ip}; ${entries.length} entries returned`);
-    res.status(200).json({ entries });
+
+    const tableRows = entries.map((entry) => {
+        const platform = entry.platform ? entry.platform.replace(/^"+|"+$/g, '') : '–';
+        const uri = entry.uri ? he.encode(entry.uri) : '–';
+        const jti = entry.jti ? he.encode(entry.jti) : '–';
+        const viaLabel = entry.via === 'login' ? 'Login' : 'Verify';
+        return `
+            <tr>
+                <td>${he.encode(entry.user)}</td>
+                <td><span title="${new Date(entry.at).toISOString()}">${he.encode(formatTimestamp(entry.at))}</span></td>
+                <td>${he.encode(entry.ip)}</td>
+                <td>${he.encode(entry.host)}</td>
+                <td>${uri}</td>
+                <td>${he.encode(platform)}</td>
+                <td><span class="pill pill--muted">${he.encode(viaLabel)}</span></td>
+                <td><span class="code">${jti}</span></td>
+                <td><span class="meta">${he.encode(entry.userAgent)}</span></td>
+            </tr>
+        `;
+    }).join('') || `
+        <tr>
+            <td colspan="9" class="table__empty">Keine Einträge vorhanden.</td>
+        </tr>
+    `;
+
+    const body = `
+        <h1>Letzte Aktivität</h1>
+        <p class="meta">Anzeige des letzten Logins/Verifies pro Nutzer (aus Redis gespeichert).</p>
+        <div class="table-wrapper">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Nutzer</th>
+                        <th>Wann</th>
+                        <th>IP</th>
+                        <th>Host</th>
+                        <th>URI</th>
+                        <th>Gerät</th>
+                        <th>Quelle</th>
+                        <th>JTI</th>
+                        <th>User Agent</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tableRows}
+                </tbody>
+            </table>
+        </div>
+    `;
+
+    res.status(200).send(getPageHTML('Letzte Aktivität', body, { containerClass: 'container--wide' }));
 };
 
 void (async () => {
@@ -1047,9 +1092,7 @@ void (async () => {
         app.get('/verify', verifyLimiter, verifyHandler);
         app.post('/auth/app-token', verifyLimiter, appTokenHandler);
         app.get('/admin/last-seen', adminLastSeenHandler);
-        logger.info(ADMIN_API_TOKEN
-            ? '[admin] /admin/last-seen enabled (admin session or static token accepted)'
-            : '[admin] /admin/last-seen enabled (admin session required)');
+        logger.info('[admin] /admin/last-seen enabled (admin session required)');
 
         // Removed /still-logged route
 

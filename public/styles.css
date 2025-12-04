@@ -17,6 +17,10 @@ body {
     width: 100%;
     max-width: 420px;
 }
+.container--wide {
+    max-width: 1100px;
+    text-align: left;
+}
 h1 {
     margin: .25rem 0 1rem;
     font-size: 1.35rem;
@@ -77,5 +81,58 @@ a:hover {
 }
 p {
     margin-bottom: 1.5rem;
+}
+.meta {
+    margin: 0 0 1rem 0;
+    color: #6b7280;
+    font-size: 0.95rem;
+}
+.table-wrapper {
+    overflow-x: auto;
+    margin-top: 1rem;
+}
+.table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.95rem;
+}
+.table th,
+.table td {
+    padding: 0.75rem 0.5rem;
+    border-bottom: 1px solid #e5e7eb;
+    vertical-align: top;
+    text-align: left;
+}
+.table th {
+    background: #f9fafb;
+    font-weight: 600;
+    color: #374151;
+}
+.table__empty {
+    text-align: center;
+    color: #6b7280;
+}
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    background: #eef2ff;
+    color: #4338ca;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+.pill--muted {
+    background: #e5e7eb;
+    color: #374151;
+}
+.code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    background: #f3f4f6;
+    color: #111827;
+    padding: 0.15rem 0.35rem;
+    border-radius: 6px;
+    display: inline-block;
 }
 /* removed unused toast styles and animations */

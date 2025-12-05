@@ -382,7 +382,7 @@ function validateRedirectUri(uri: string): string {
 
 function getOriginalUrl(req: Request): string {
     const proto = req.header('X-Forwarded-Proto') ?? 'https';
-    const host = req.header('X-Forwarded-Host') ?? req.hostname;
+    const host = req.hostname;
     const uri = req.header('X-Forwarded-Uri') ?? '/';
     return `${proto}://${host}${uri}`;
 }
@@ -633,7 +633,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
             throw new Error('User not found');
         }
 
-        const requestedHost = req.header('X-Forwarded-Host') ?? req.hostname;
+        const requestedHost = req.hostname;
         if (!requestedHost) {
             throw new Error('Host header missing');
         }
@@ -721,7 +721,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     const userAgent = getHeaderString(req as Request, 'user-agent') || 'unknown';
     const platformHeader = getHeaderString(req as Request, 'sec-ch-ua-platform');
     const platform = platformHeader || undefined;
-    const requestHost = req.header('X-Forwarded-Host') ?? req.hostname;
+    const requestHost = req.hostname;
 
     const rawRedirectUri = req.query.redirect_uri ?? req.body?.redirect_uri;
     const validatedDestinationUri = validateRedirectUri(rawRedirectUri ?? getOriginalUrl(req as Request));

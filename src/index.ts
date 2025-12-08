@@ -274,6 +274,91 @@ function isRecordOfUser(data: unknown): data is Record<string, User> {
     );
 }
 
+function extractTopLevelUsernames(jsonContent: string): string[] {
+    const keys: string[] = [];
+    let inString = false;
+    let escaped = false;
+    let depth = 0;
+    let current = '';
+    let lastString: string | null = null;
+
+    for (const char of jsonContent) {
+        if (inString) {
+            if (escaped) {
+                current += char;
+                escaped = false;
+                continue;
+            }
+
+            if (char === '\\') {
+                current += char;
+                escaped = true;
+                continue;
+            }
+
+            if (char === '"') {
+                inString = false;
+                lastString = current;
+                current = '';
+                continue;
+            }
+
+            current += char;
+            continue;
+        }
+
+        if (char === '"') {
+            inString = true;
+            current = '';
+            continue;
+        }
+
+        if (char === '{') {
+            depth++;
+            continue;
+        }
+
+        if (char === '}') {
+            depth = Math.max(0, depth - 1);
+            lastString = null;
+            continue;
+        }
+
+        if (char === ':' && depth === 1 && lastString !== null) {
+            try {
+                const decoded = JSON.parse(`"${lastString}"`) as string;
+                keys.push(decoded);
+            } catch {
+                keys.push(lastString);
+            }
+            lastString = null;
+            continue;
+        }
+
+        if (char === ',' || char.trim() !== '') {
+            lastString = null;
+        }
+    }
+
+    return keys;
+}
+
+function findDuplicateUsernames(jsonContent: string): string[] {
+    const usernames = extractTopLevelUsernames(jsonContent);
+    const seen = new Set<string>();
+    const duplicates = new Set<string>();
+
+    for (const name of usernames) {
+        if (seen.has(name)) {
+            duplicates.add(name);
+        } else {
+            seen.add(name);
+        }
+    }
+
+    return Array.from(duplicates);
+}
+
 function normalizeHost(host: string): string {
     const primaryHost = host.split(',')[0] ?? '';
     const withoutPort = primaryHost.split(':')[0] ?? '';
@@ -333,10 +418,22 @@ async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
     const { fatal = true } = options;
     try {
         const rawContent = await fs.readFile(USER_FILE, 'utf-8');
+        const duplicateUsernames = findDuplicateUsernames(rawContent);
         const raw: unknown = JSON.parse(rawContent);
 
         if (!isRecordOfUser(raw)) {
             throw new Error('Invalid users.json structure');
+        }
+
+        if (duplicateUsernames.length > 0) {
+            const message = `Duplicate usernames detected: ${duplicateUsernames.join(', ')}`;
+            if (fatal) {
+                logger.error(`[users] FATAL: ${message}`);
+                process.exit(1);
+            } else {
+                logger.warn(`[users] ${message}. Reload skipped; keeping previous users.`);
+                return;
+            }
         }
 
         users = raw;

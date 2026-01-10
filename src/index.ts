@@ -76,9 +76,11 @@ const APP_TOKEN_TTL_S = getEnvAsNumber('APP_TOKEN_TTL_S', 172800);
 const LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('LOGIN_LIMITER_WINDOW_S', 15 * 60);
 const VERIFY_LIMITER_WINDOW_S = getEnvAsNumber('VERIFY_LIMITER_WINDOW_S', 60);
 const AUTH_PAGE_LIMITER_WINDOW_S = getEnvAsNumber('AUTH_PAGE_LIMITER_WINDOW_S', 15 * 60);
+const ADMIN_LAST_SEEN_LIMITER_WINDOW_S = getEnvAsNumber('ADMIN_LAST_SEEN_LIMITER_WINDOW_S', 60);
 const LOGIN_LIMITER_MAX = getEnvAsNumber('LOGIN_LIMITER_MAX', 10);
 const VERIFY_LIMITER_MAX = getEnvAsNumber('VERIFY_LIMITER_MAX', 5000);
 const AUTH_PAGE_LIMITER_MAX = getEnvAsNumber('AUTH_PAGE_LIMITER_MAX', 300);
+const ADMIN_LAST_SEEN_LIMITER_MAX = getEnvAsNumber('ADMIN_LAST_SEEN_LIMITER_MAX', 30);
 const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
 const DOMAIN = process.env.DOMAIN;
@@ -124,6 +126,7 @@ let redisClient: RedisClientType;
 let loginStore: RateLimitStore;
 let verifyStore: RateLimitStore;
 let authPageStore: RateLimitStore;
+let adminLastSeenStore: RateLimitStore;
 
 if (REDIS_URL) {
     redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD });
@@ -158,11 +161,13 @@ function logStartupConfig(): void {
             loginLimiterWindowS: LOGIN_LIMITER_WINDOW_S,
             verifyLimiterWindowS: VERIFY_LIMITER_WINDOW_S,
             authPageLimiterWindowS: AUTH_PAGE_LIMITER_WINDOW_S,
+            adminLastSeenLimiterWindowS: ADMIN_LAST_SEEN_LIMITER_WINDOW_S,
         },
         limits: {
             loginLimiterMax: LOGIN_LIMITER_MAX,
             verifyLimiterMax: VERIFY_LIMITER_MAX,
             authPageLimiterMax: AUTH_PAGE_LIMITER_MAX,
+            adminLastSeenLimiterMax: ADMIN_LAST_SEEN_LIMITER_MAX,
         },
         users: {
             file: USER_FILE,
@@ -243,6 +248,7 @@ app.set('trust proxy', 1);
 let loginLimiter: RequestHandler;
 let verifyLimiter: RequestHandler;
 let authPageLimiter: RequestHandler;
+let adminLastSeenLimiter: RequestHandler;
 
 // Toast page removed
 
@@ -1148,6 +1154,7 @@ void (async () => {
         loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
         verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
         authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
+        adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
 
         // Initialize rate limiters with Redis store
         loginLimiter = rateLimit({
@@ -1174,6 +1181,14 @@ void (async () => {
             message: 'Zu viele Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
             store: authPageStore,
         });
+        adminLastSeenLimiter = rateLimit({
+            windowMs: ADMIN_LAST_SEEN_LIMITER_WINDOW_S * 1000,
+            limit: ADMIN_LAST_SEEN_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Admin-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
+            store: adminLastSeenStore,
+        });
 
         // Initialize session store (Redis only)
         sessionStore = new RedisSessionStore(redisClient);
@@ -1188,7 +1203,7 @@ void (async () => {
         app.get('/logout', logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);
         app.post('/auth/app-token', verifyLimiter, appTokenHandler);
-        app.get('/admin/last-seen', adminLastSeenHandler);
+        app.get('/admin/last-seen', adminLastSeenLimiter, adminLastSeenHandler);
         logger.info('[admin] /admin/last-seen enabled (admin session required)');
 
         // Removed /still-logged route

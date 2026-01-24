@@ -71,8 +71,6 @@ const JWT_SECRET = new TextEncoder().encode(secretEnv);
 const USER_FILE = process.env.USER_FILE ?? path.resolve(process.cwd(), 'users.json');
 const PORT = getEnvAsNumber('PORT', 3000);
 const COOKIE_MAX_AGE_S = getEnvAsNumber('COOKIE_MAX_AGE_S', 3600);
-// 48h default for app tokens
-const APP_TOKEN_TTL_S = getEnvAsNumber('APP_TOKEN_TTL_S', 172800);
 const LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('LOGIN_LIMITER_WINDOW_S', 15 * 60);
 const VERIFY_LIMITER_WINDOW_S = getEnvAsNumber('VERIFY_LIMITER_WINDOW_S', 60);
 const AUTH_PAGE_LIMITER_WINDOW_S = getEnvAsNumber('AUTH_PAGE_LIMITER_WINDOW_S', 15 * 60);
@@ -155,7 +153,6 @@ function logStartupConfig(): void {
         jwtIssuer: JWT_ISSUER,
         loginRedirectUrl: LOGIN_REDIRECT_URL,
         cookieMaxAgeS: COOKIE_MAX_AGE_S,
-        appTokenTtlS: APP_TOKEN_TTL_S,
         sessionMaxPerUser: MAX_SESSIONS_PER_USER,
         windows: {
             loginLimiterWindowS: LOGIN_LIMITER_WINDOW_S,
@@ -1013,60 +1010,6 @@ const logoutHandler: RequestHandler = async (req, res) => {
     res.status(200).send(getPageHTML('Abgemeldet', logoutBody));
 };
 
-interface AppTokenResponse {
-    appToken: string;
-}
-
-const appTokenHandler: RequestHandler = async (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-
-    try {
-        const parsedCookies = cookie.parse(req.headers.cookie ?? '');
-        const token = parsedCookies[COOKIE_NAME];
-        if (!token) {
-            logger.warn('[app-token] No session cookie found');
-            res.status(401).json({ error: 'unauthorized' });
-            return;
-        }
-
-        const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
-
-        if (typeof payload.sub !== 'string') {
-            logger.warn('[app-token] Session token without subject');
-            res.status(401).json({ error: 'unauthorized' });
-            return;
-        }
-
-        // Session check to ensure only active sessions can request app tokens
-        if (typeof payload.jti === 'string') {
-            const active = await sessionStore.isActive(payload.sub, payload.jti);
-            if (!active) {
-                logger.warn(`[app-token] Inactive session for user "${payload.sub}"`);
-                res.status(401).json({ error: 'session_inactive' });
-                return;
-            }
-        }
-
-        const userId = payload.sub;
-
-        const userIsAdult = users[userId]?.isAdult === true;
-
-        const appJwt = await new SignJWT({ type: 'app', isAdult: userIsAdult })
-            .setProtectedHeader({ alg: 'HS256' })
-            .setIssuer(JWT_ISSUER)
-            .setSubject(userId)
-            .setIssuedAt()
-            .setExpirationTime(`${APP_TOKEN_TTL_S}s`)
-            .sign(JWT_SECRET);
-
-        const response: AppTokenResponse = { appToken: appJwt };
-        res.status(200).json(response);
-    } catch (error) {
-        logger.error('[app-token] Failed to issue app token', error);
-        res.status(500).json({ error: 'internal_error' });
-    }
-};
-
 const adminLastSeenHandler: RequestHandler = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
@@ -1202,7 +1145,6 @@ void (async () => {
         app.get('/auth', authPageLimiter, loginPageHandler);
         app.get('/logout', logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);
-        app.post('/auth/app-token', verifyLimiter, appTokenHandler);
         app.get('/admin/last-seen', adminLastSeenLimiter, adminLastSeenHandler);
         logger.info('[admin] /admin/last-seen enabled (admin session required)');
 

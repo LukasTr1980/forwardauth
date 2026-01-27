@@ -814,6 +814,59 @@ const verifyHandler: RequestHandler = async (req, res) => {
     }
 };
 
+const statusHandler: RequestHandler = async (req, res) => {
+    const sourceIp = req.ip ?? 'unknown';
+    logger.debug(`[status] Status check from IP: ${sourceIp}`);
+
+    try {
+        const parsedCookies = cookie.parse(req.headers.cookie ?? '');
+        let token: string | undefined;
+        let isAppToken = false;
+
+        const authHeader = getHeaderString(req, 'authorization');
+        if (authHeader?.toLowerCase().startsWith('bearer ')) {
+            token = authHeader.slice('bearer '.length).trim();
+            isAppToken = true;
+        } else {
+            token = parsedCookies[COOKIE_NAME];
+        }
+
+        if (!token) throw new Error('No token found');
+
+        const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+
+        if (typeof payload.sub !== 'string') {
+            throw new Error('Token subject missing');
+        }
+
+        const userRecord = users[payload.sub];
+        if (!userRecord) {
+            throw new Error('User not found');
+        }
+
+        // Enforce active session check when token carries a JTI (browser sessions only)
+        if (!isAppToken && typeof payload.jti === 'string') {
+            const active = await sessionStore.isActive(payload.sub, payload.jti);
+            if (!active) {
+                throw new Error('Session not active');
+            }
+        }
+
+        const userIsAdult = userRecord.isAdult === true || payload.isAdult === true;
+
+        res.set('Cache-Control', 'no-store');
+        res.set('Vary', 'Cookie');
+        res.status(200).json({ loggedIn: true, user: payload.sub, isAdult: userIsAdult });
+        return;
+    } catch (error) {
+        const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid, expired, or inactive session token';
+        logger.debug(`[status] Status check failed for IP ${sourceIp}: ${reason}`);
+        res.set('Cache-Control', 'no-store');
+        res.set('Vary', 'Cookie');
+        res.status(401).json({ loggedIn: false });
+    }
+};
+
 const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>, string, LoginBody, LoginQuery> = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
@@ -1143,6 +1196,7 @@ void (async () => {
         });
         app.post('/auth', loginLimiter, loginPageHandler);
         app.get('/auth', authPageLimiter, loginPageHandler);
+        app.get('/auth/status', verifyLimiter, statusHandler);
         app.get('/logout', logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);
         app.get('/admin/last-seen', adminLastSeenLimiter, adminLastSeenHandler);

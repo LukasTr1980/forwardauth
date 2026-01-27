@@ -710,12 +710,10 @@ const verifyHandler: RequestHandler = async (req, res) => {
     try {
         const parsedCookies = cookie.parse(req.headers.cookie ?? '');
         let token: string | undefined;
-        let isAppToken = false;
 
         const authHeader = getHeaderString(req, 'authorization');
         if (authHeader?.toLowerCase().startsWith('bearer ')) {
             token = authHeader.slice('bearer '.length).trim();
-            isAppToken = true;
         } else {
             token = parsedCookies[COOKIE_NAME];
         }
@@ -765,12 +763,14 @@ const verifyHandler: RequestHandler = async (req, res) => {
             return;
         }
 
-        // Enforce active session check when token carries a JTI (browser sessions only)
-        if (!isAppToken && typeof payload.jti === 'string') {
-            const active = await sessionStore.isActive(payload.sub, payload.jti);
-            if (!active) {
-                throw new Error('Session not active');
-            }
+        if (typeof payload.jti !== 'string' || payload.jti.trim() === '') {
+            throw new Error('Token jti missing');
+        }
+
+        // Require active session for all tokens (including bearer tokens).
+        const active = await sessionStore.isActive(payload.sub, payload.jti);
+        if (!active) {
+            throw new Error('Session not active');
         }
 
         logger.debug(`[verify] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
@@ -821,12 +821,10 @@ const statusHandler: RequestHandler = async (req, res) => {
     try {
         const parsedCookies = cookie.parse(req.headers.cookie ?? '');
         let token: string | undefined;
-        let isAppToken = false;
 
         const authHeader = getHeaderString(req, 'authorization');
         if (authHeader?.toLowerCase().startsWith('bearer ')) {
             token = authHeader.slice('bearer '.length).trim();
-            isAppToken = true;
         } else {
             token = parsedCookies[COOKIE_NAME];
         }
@@ -844,12 +842,14 @@ const statusHandler: RequestHandler = async (req, res) => {
             throw new Error('User not found');
         }
 
-        // Enforce active session check when token carries a JTI (browser sessions only)
-        if (!isAppToken && typeof payload.jti === 'string') {
-            const active = await sessionStore.isActive(payload.sub, payload.jti);
-            if (!active) {
-                throw new Error('Session not active');
-            }
+        if (typeof payload.jti !== 'string' || payload.jti.trim() === '') {
+            throw new Error('Token jti missing');
+        }
+
+        // Require active session for all tokens (including bearer tokens).
+        const active = await sessionStore.isActive(payload.sub, payload.jti);
+        if (!active) {
+            throw new Error('Session not active');
         }
 
         const userIsAdult = userRecord.isAdult === true || payload.isAdult === true;

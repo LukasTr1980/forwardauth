@@ -772,7 +772,52 @@ async function fetchSessionOverview(): Promise<UserSessionOverview[]> {
             lastSeen: lastSeenMap.get(user),
         });
     }
+    results.sort((a, b) => {
+        const aSeen = a.lastSeen?.at ?? 0;
+        const bSeen = b.lastSeen?.at ?? 0;
+        if (aSeen === bSeen) {
+            return a.user.localeCompare(b.user, 'de');
+        }
+        return bSeen - aSeen;
+    });
     return results;
+}
+
+async function cleanupOrphanedSessions(): Promise<{ users: number; scanned: number; removed: number }> {
+    const userKeys = await scanKeys(`${SESSION_USER_PREFIX}*`);
+    let scanned = 0;
+    let removed = 0;
+    let usersTouched = 0;
+
+    for (const userKey of userKeys) {
+        const user = userKey.slice(SESSION_USER_PREFIX.length);
+        if (!user) continue;
+        const jtis = await redisClient.zRange(userKey, 0, -1);
+        if (jtis.length === 0) {
+            await redisClient.del(userKey);
+            continue;
+        }
+        scanned += jtis.length;
+        const tokenKeys = jtis.map((jti) => `${SESSION_TOKEN_PREFIX}${jti}`);
+        const tokenValues = await redisClient.mGet(tokenKeys);
+        const toRemove: string[] = [];
+        tokenValues.forEach((val, index) => {
+            if (val !== user) {
+                toRemove.push(jtis[index]);
+            }
+        });
+        if (toRemove.length > 0) {
+            const multi = redisClient.multi();
+            for (const jti of toRemove) {
+                multi.zRem(userKey, jti);
+            }
+            await multi.exec();
+            removed += toRemove.length;
+            usersTouched++;
+        }
+    }
+
+    return { users: usersTouched, scanned, removed };
 }
 
 async function authenticateAdmin(req: Request): Promise<string | null> {
@@ -1267,7 +1312,7 @@ const adminSessionsHandler: RequestHandler = async (req, res) => {
             const expLabel = session.expiryMs ? formatTimestamp(session.expiryMs) : '–';
             const expTitle = session.expiryMs ? new Date(session.expiryMs).toISOString() : '';
             const statusClass = session.active ? 'pill' : 'pill pill--muted';
-            const statusLabel = session.active ? 'Aktiv' : 'Inaktiv';
+            const statusLabel = session.active ? 'Gültig' : 'Ungültig';
             return `
                 <div class="session-entry">
                     <span class="${statusClass}">${he.encode(statusLabel)}</span>
@@ -1303,11 +1348,14 @@ const adminSessionsHandler: RequestHandler = async (req, res) => {
 
     const body = `
         <h1>Aktive Sitzungen</h1>
-        <p class="meta">Direkt aus Redis geladen. Nur Admin-Zugriff. Sessions gelten als aktiv, wenn ein passender sess:token-Eintrag existiert.</p>
+        <p class="meta">Direkt aus Redis geladen. Nur Admin-Zugriff. Sessions gelten als gültig, wenn ein passender sess:token-Eintrag existiert.</p>
         ${noticeText ? `<div class="alert">${he.encode(noticeText)}</div>` : ''}
         <div class="stat">
             <span class="pill">Nutzer: ${he.encode(String(entries.length))}</span>
-            <span class="pill pill--muted">Aktiv: ${he.encode(String(totalActive))} / ${he.encode(String(totalSessions))}</span>
+            <span class="pill pill--muted">Gültig: ${he.encode(String(totalActive))} / ${he.encode(String(totalSessions))}</span>
+            <form class="inline-form" method="post" action="/admin/sessions/cleanup">
+                <button class="button--small button--danger" type="submit" onclick="return confirm('Ungültige Sessions aus Redis entfernen?')">Cleanup</button>
+            </form>
         </div>
         <div class="table-wrapper">
             <table class="table">
@@ -1315,7 +1363,7 @@ const adminSessionsHandler: RequestHandler = async (req, res) => {
                     <tr>
                         <th>Nutzer</th>
                         <th>Letzte Aktivität</th>
-                        <th>Aktiv/Gesamt</th>
+                        <th>Gültig/Gesamt</th>
                         <th>Sessions</th>
                         <th>Aktion</th>
                     </tr>
@@ -1375,6 +1423,34 @@ const adminSessionsRevokeHandler: RequestHandler<ParamsDictionary, string, Admin
 
     logger.info(`[admin] Sessions revoked for user "${user}" by "${adminUser}" (jtis=${jtis.length})`);
     const notice = encodeURIComponent(`Sitzungen für "${user}" gelöscht (${jtis.length}).`);
+    res.redirect(`/admin/sessions?notice=${notice}`);
+};
+
+const adminSessionsCleanupHandler: RequestHandler = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const adminUser = await authenticateAdmin(req);
+    if (!adminUser) {
+        logger.warn(`[admin] Unauthorized session cleanup attempt from IP: ${req.ip}`);
+        const body = '<div class="alert alert--error">Zugriff verweigert. Bitte als Admin anmelden.</div>';
+        res.status(401).send(getPageHTML('Zugriff verweigert', body));
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[admin] Cross-site cleanup blocked from IP: ${req.ip} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+        const body = '<div class="alert alert--error">Ungültige Anfrageherkunft.</div>';
+        res.status(403).send(getPageHTML('Zugriff verweigert', body));
+        return;
+    }
+
+    const result = await cleanupOrphanedSessions();
+    logger.info(
+        `[admin] Session cleanup by "${adminUser}" removed=${result.removed} scanned=${result.scanned} users=${result.users}`
+    );
+    const notice = encodeURIComponent(
+        `Cleanup: ${result.removed} ungültige Sessions entfernt (gescannt ${result.scanned}, Nutzer ${result.users}).`
+    );
     res.redirect(`/admin/sessions?notice=${notice}`);
 };
 
@@ -1451,6 +1527,7 @@ void (async () => {
         app.get('/admin/last-seen', adminLastSeenLimiter, adminLastSeenHandler);
         app.get('/admin/sessions', adminLastSeenLimiter, adminSessionsHandler);
         app.post('/admin/sessions/revoke', adminLastSeenLimiter, adminSessionsRevokeHandler);
+        app.post('/admin/sessions/cleanup', adminLastSeenLimiter, adminSessionsCleanupHandler);
         logger.info('[admin] /admin/last-seen enabled (admin session required)');
         logger.info('[admin] /admin/sessions enabled (admin session required)');
 

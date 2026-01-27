@@ -611,6 +611,20 @@ interface LastSeenRecord extends LastSeenPayload {
     user: string;
 }
 
+interface SessionEntry {
+    jti: string;
+    expiryMs: number;
+    active: boolean;
+}
+
+interface UserSessionOverview {
+    user: string;
+    sessions: SessionEntry[];
+    activeCount: number;
+    totalCount: number;
+    lastSeen?: LastSeenRecord;
+}
+
 function formatTimestamp(ms: number): string {
     const date = new Date(ms);
     if (Number.isNaN(date.getTime())) return '–';
@@ -675,6 +689,90 @@ async function fetchLastSeen(): Promise<LastSeenRecord[]> {
         logger.error('[lastseen] Failed to fetch last-seen data from Redis', error);
         return [];
     }
+}
+
+const SESSION_USER_PREFIX = 'sess:user:';
+const SESSION_TOKEN_PREFIX = 'sess:token:';
+
+function isUnknownArray(value: unknown): value is unknown[] {
+    return Array.isArray(value);
+}
+
+async function scanKeys(pattern: string, count = 200): Promise<string[]> {
+    const keys: string[] = [];
+    let cursor = '0';
+    do {
+        const reply: unknown = await redisClient.sendCommand(['SCAN', cursor, 'MATCH', pattern, 'COUNT', String(count)]);
+        if (isUnknownArray(reply) && reply.length >= 2) {
+            const nextCursor = typeof reply[0] === 'string' ? reply[0] : String(reply[0]);
+            const batchRaw = reply[1];
+            if (Array.isArray(batchRaw)) {
+                const batch = batchRaw.filter((item): item is string => typeof item === 'string');
+                keys.push(...batch);
+            }
+            cursor = nextCursor;
+        } else {
+            cursor = '0';
+        }
+    } while (cursor !== '0');
+    return keys;
+}
+
+function parseZsetWithScores(raw: string[] | RedisReply): { value: string; score: number }[] {
+    if (!Array.isArray(raw)) return [];
+    const results: { value: string; score: number }[] = [];
+    for (let i = 0; i < raw.length; i += 2) {
+        const value = raw[i];
+        const scoreRaw = raw[i + 1];
+        if (typeof value !== 'string') continue;
+        const score = Number.parseInt(String(scoreRaw), 10);
+        results.push({ value, score: Number.isFinite(score) ? score : 0 });
+    }
+    return results;
+}
+
+async function fetchUserSessions(user: string): Promise<SessionEntry[]> {
+    const userKey = `${SESSION_USER_PREFIX}${user}`;
+    const raw = await redisClient.sendCommand(['ZRANGE', userKey, '0', '-1', 'WITHSCORES']);
+    const entries = parseZsetWithScores(raw)
+        .map(({ value, score }) => ({
+            jti: value,
+            expiryMs: score,
+            active: false,
+        }));
+    if (entries.length === 0) return [];
+
+    const tokenKeys = entries.map((entry) => `${SESSION_TOKEN_PREFIX}${entry.jti}`);
+    const tokenValues = await redisClient.mGet(tokenKeys);
+    entries.forEach((entry, index) => {
+        entry.active = tokenValues[index] === user;
+    });
+    entries.sort((a, b) => b.expiryMs - a.expiryMs);
+    return entries;
+}
+
+async function fetchSessionOverview(): Promise<UserSessionOverview[]> {
+    const userKeys = await scanKeys(`${SESSION_USER_PREFIX}*`);
+    const users = userKeys
+        .map((key) => key.slice(SESSION_USER_PREFIX.length))
+        .filter((user) => user.length > 0)
+        .sort((a, b) => a.localeCompare(b, 'de'));
+    const lastSeenEntries = await fetchLastSeen();
+    const lastSeenMap = new Map(lastSeenEntries.map((entry) => [entry.user, entry]));
+
+    const results: UserSessionOverview[] = [];
+    for (const user of users) {
+        const sessions = await fetchUserSessions(user);
+        const activeCount = sessions.filter((entry) => entry.active).length;
+        results.push({
+            user,
+            sessions,
+            activeCount,
+            totalCount: sessions.length,
+            lastSeen: lastSeenMap.get(user),
+        });
+    }
+    return results;
 }
 
 async function authenticateAdmin(req: Request): Promise<string | null> {
@@ -1129,6 +1227,157 @@ const adminLastSeenHandler: RequestHandler = async (req, res) => {
     res.status(200).send(getPageHTML('Letzte Aktivität', body, { containerClass: 'container--wide' }));
 };
 
+interface AdminRevokeBody {
+    user?: string;
+}
+
+const adminSessionsHandler: RequestHandler = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const adminUser = await authenticateAdmin(req);
+    if (!adminUser) {
+        logger.warn(`[admin] Unauthorized sessions access attempt from IP: ${req.ip}`);
+        const body = '<div class="alert alert--error">Zugriff verweigert. Bitte als Admin anmelden.</div>';
+        res.status(401).send(getPageHTML('Zugriff verweigert', body));
+        return;
+    }
+
+    const notice = typeof req.query.notice === 'string' ? req.query.notice : undefined;
+    const noticeText = notice ?? '';
+    const entries = await fetchSessionOverview();
+    const totalActive = entries.reduce((acc, entry) => acc + entry.activeCount, 0);
+    const totalSessions = entries.reduce((acc, entry) => acc + entry.totalCount, 0);
+    logger.info(`[admin] Session overview requested by "${adminUser}" from IP ${req.ip}; users=${entries.length} active=${totalActive}`);
+
+    const tableRows = entries.map((entry) => {
+        const lastSeen = entry.lastSeen;
+        const lastSeenWhen = lastSeen ? formatTimestamp(lastSeen.at) : '–';
+        const lastSeenTitle = lastSeen ? new Date(lastSeen.at).toISOString() : '';
+        const lastSeenMeta = lastSeen ? `${lastSeen.ip} • ${lastSeen.host}` : '';
+        const lastSeenUri = lastSeen?.uri ?? '';
+        const lastSeenHtml = lastSeen
+            ? `
+                <div><span title="${he.encode(lastSeenTitle)}">${he.encode(lastSeenWhen)}</span></div>
+                <div class="meta">${he.encode(lastSeenMeta)}</div>
+                ${lastSeenUri ? `<div class="meta">${he.encode(lastSeenUri)}</div>` : ''}
+            `
+            : '–';
+
+        const sessionItems = entry.sessions.map((session) => {
+            const expLabel = session.expiryMs ? formatTimestamp(session.expiryMs) : '–';
+            const expTitle = session.expiryMs ? new Date(session.expiryMs).toISOString() : '';
+            const statusClass = session.active ? 'pill' : 'pill pill--muted';
+            const statusLabel = session.active ? 'Aktiv' : 'Inaktiv';
+            return `
+                <div class="session-entry">
+                    <span class="${statusClass}">${he.encode(statusLabel)}</span>
+                    <span title="${he.encode(expTitle)}" class="code">${he.encode(expLabel)}</span>
+                    <span class="code">${he.encode(session.jti)}</span>
+                </div>
+            `;
+        }).join('') || '<div class="meta">Keine Sessions gefunden.</div>';
+
+        const action = entry.totalCount > 0
+            ? `
+                <form class="inline-form" method="post" action="/admin/sessions/revoke">
+                    <input type="hidden" name="user" value="${he.encode(entry.user)}" />
+                    <button class="button--small button--danger" type="submit" onclick="return confirm('Alle Sessions löschen?')">Sessions löschen</button>
+                </form>
+            `
+            : '<span class="meta">–</span>';
+
+        return `
+            <tr>
+                <td>${he.encode(entry.user)}</td>
+                <td>${lastSeenHtml}</td>
+                <td><span class="stat">${he.encode(`${entry.activeCount} / ${entry.totalCount}`)}</span></td>
+                <td><div class="session-list">${sessionItems}</div></td>
+                <td>${action}</td>
+            </tr>
+        `;
+    }).join('') || `
+        <tr>
+            <td colspan="5" class="table__empty">Keine Sessions gefunden.</td>
+        </tr>
+    `;
+
+    const body = `
+        <h1>Aktive Sitzungen</h1>
+        <p class="meta">Direkt aus Redis geladen. Nur Admin-Zugriff. Sessions gelten als aktiv, wenn ein passender sess:token-Eintrag existiert.</p>
+        ${noticeText ? `<div class="alert">${he.encode(noticeText)}</div>` : ''}
+        <div class="stat">
+            <span class="pill">Nutzer: ${he.encode(String(entries.length))}</span>
+            <span class="pill pill--muted">Aktiv: ${he.encode(String(totalActive))} / ${he.encode(String(totalSessions))}</span>
+        </div>
+        <div class="table-wrapper">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Nutzer</th>
+                        <th>Letzte Aktivität</th>
+                        <th>Aktiv/Gesamt</th>
+                        <th>Sessions</th>
+                        <th>Aktion</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tableRows}
+                </tbody>
+            </table>
+        </div>
+    `;
+
+    res.status(200).send(getPageHTML('Aktive Sitzungen', body, { containerClass: 'container--wide' }));
+};
+
+const adminSessionsRevokeHandler: RequestHandler<ParamsDictionary, string, AdminRevokeBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const adminUser = await authenticateAdmin(req);
+    if (!adminUser) {
+        logger.warn(`[admin] Unauthorized session revoke attempt from IP: ${req.ip}`);
+        const body = '<div class="alert alert--error">Zugriff verweigert. Bitte als Admin anmelden.</div>';
+        res.status(401).send(getPageHTML('Zugriff verweigert', body));
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[admin] Cross-site revoke blocked from IP: ${req.ip} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+        const body = '<div class="alert alert--error">Ungültige Anfrageherkunft.</div>';
+        res.status(403).send(getPageHTML('Zugriff verweigert', body));
+        return;
+    }
+
+    const user = typeof req.body.user === 'string' ? req.body.user.trim() : '';
+    if (!user) {
+        res.redirect('/admin/sessions?notice=Ungültiger Nutzer.');
+        return;
+    }
+
+    const userKey = `${SESSION_USER_PREFIX}${user}`;
+    let jtis: string[] = [];
+    try {
+        jtis = await redisClient.zRange(userKey, 0, -1);
+    } catch (error) {
+        logger.error(`[admin] Failed to fetch sessions for "${user}"`, error);
+    }
+
+    if (jtis.length > 0) {
+        const multi = redisClient.multi();
+        for (const jti of jtis) {
+            multi.del(`${SESSION_TOKEN_PREFIX}${jti}`);
+        }
+        multi.del(userKey);
+        await multi.exec();
+    } else {
+        await redisClient.del(userKey);
+    }
+
+    logger.info(`[admin] Sessions revoked for user "${user}" by "${adminUser}" (jtis=${jtis.length})`);
+    const notice = encodeURIComponent(`Sitzungen für "${user}" gelöscht (${jtis.length}).`);
+    res.redirect(`/admin/sessions?notice=${notice}`);
+};
+
 void (async () => {
     await loadUsers();
 
@@ -1200,7 +1449,10 @@ void (async () => {
         app.get('/logout', logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);
         app.get('/admin/last-seen', adminLastSeenLimiter, adminLastSeenHandler);
+        app.get('/admin/sessions', adminLastSeenLimiter, adminSessionsHandler);
+        app.post('/admin/sessions/revoke', adminLastSeenLimiter, adminSessionsRevokeHandler);
         logger.info('[admin] /admin/last-seen enabled (admin session required)');
+        logger.info('[admin] /admin/sessions enabled (admin session required)');
 
         // Removed /still-logged route
 

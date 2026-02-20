@@ -146,6 +146,14 @@
         element.style.color = isError ? '#b91c1c' : '#6b7280';
     }
 
+    function getAllowedDomain() {
+        const node = byId('passkey-allowed-domain');
+        if (!node || typeof node.value !== 'string') {
+            return '';
+        }
+        return node.value.trim().toLowerCase();
+    }
+
     function clearElement(element) {
         while (element.firstChild) {
             element.removeChild(element.firstChild);
@@ -162,7 +170,7 @@
         container.appendChild(paragraph);
     }
 
-    function sanitizeRedirectTarget(target) {
+    function sanitizeRedirectTarget(target, allowedDomain) {
         if (typeof target !== 'string' || target.trim() === '') {
             return '/';
         }
@@ -172,10 +180,18 @@
             if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
                 return '/';
             }
-            if (parsed.origin !== window.location.origin) {
-                return '/';
+            if (parsed.origin === window.location.origin) {
+                return parsed.toString();
             }
-            return parsed.toString();
+
+            const host = parsed.hostname.toLowerCase();
+            if (allowedDomain) {
+                if (host === allowedDomain || host.endsWith(`.${allowedDomain}`)) {
+                    return parsed.toString();
+                }
+            }
+
+            return '/';
         } catch {
             return '/';
         }
@@ -200,6 +216,7 @@
         if (!button) return;
 
         const redirectInput = byId('passkey-login-redirect-uri');
+        const allowedDomain = getAllowedDomain();
         const message = byId('passkey-login-message');
 
         if (!supportsPasskey()) {
@@ -235,7 +252,7 @@
                     credential,
                 });
 
-                const target = sanitizeRedirectTarget(typeof verifyResponse.redirectTo === 'string' ? verifyResponse.redirectTo : '/');
+                const target = sanitizeRedirectTarget(typeof verifyResponse.redirectTo === 'string' ? verifyResponse.redirectTo : '/', allowedDomain);
                 window.location.assign(target);
             } catch (error) {
                 setMessage(message, error instanceof Error ? error.message : 'Passkey-Login fehlgeschlagen.', true);
@@ -316,6 +333,7 @@
         const list = byId('passkey-credential-list');
         const redirectInput = byId('passkey-post-register-redirect-uri');
         const autoRedirectInput = byId('passkey-auto-redirect-after-register');
+        const allowedDomain = getAllowedDomain();
 
         if (!supportsPasskey()) {
             button.disabled = true;
@@ -351,7 +369,7 @@
                 const redirectTo = redirectInput && typeof redirectInput.value === 'string' ? redirectInput.value : '';
                 if (shouldAutoRedirect && redirectTo) {
                     setMessage(message, 'Passkey erfolgreich registriert. Weiterleitung...', false);
-                    const safeRedirect = sanitizeRedirectTarget(redirectTo);
+                    const safeRedirect = sanitizeRedirectTarget(redirectTo, allowedDomain);
                     window.setTimeout(() => {
                         window.location.assign(safeRedirect);
                     }, 350);

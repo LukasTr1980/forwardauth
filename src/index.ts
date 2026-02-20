@@ -615,6 +615,7 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
                 <p class="meta">Tippen Sie auf den Button. Ein Benutzername ist meistens nicht nötig.</p>
                 <input id="passkey-login-username" placeholder="Benutzername nur falls nötig (optional)" autocomplete="username webauthn" />
                 <input id="passkey-login-redirect-uri" type="hidden" value="${safeDestinationUri}" />
+                <input id="passkey-allowed-domain" type="hidden" value="${he.encode(DOMAIN ?? '')}" />
                 <button id="passkey-login-button" type="button">Mit Passkey anmelden</button>
                 <p id="passkey-login-message" class="meta"></p>
             </div>
@@ -659,6 +660,7 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
                 <button id="passkey-register-button" type="button">Passkey einrichten</button>
                 <input id="passkey-post-register-redirect-uri" type="hidden" value="${safeDestinationUri}" />
                 <input id="passkey-auto-redirect-after-register" type="hidden" value="${autoRedirectAfterSetup ? '1' : '0'}" />
+                <input id="passkey-allowed-domain" type="hidden" value="${he.encode(DOMAIN ?? '')}" />
                 <p id="passkey-register-message" class="meta"></p>
                 <div id="passkey-credential-list" class="passkey-list"></div>
             </div>

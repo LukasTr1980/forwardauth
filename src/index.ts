@@ -611,8 +611,9 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
     const passkeySection = PASSKEY_ENABLED
         ? `
             <div class="passkey-box">
-                <p class="meta">Oder mit Passkey anmelden (Discovery-first, Benutzername optional)</p>
-                <input id="passkey-login-username" placeholder="Benutzername (optional)" autocomplete="username webauthn" />
+                <p class="passkey-title">Oder schnell mit Passkey anmelden</p>
+                <p class="meta">Tippen Sie auf den Button. Ein Benutzername ist meistens nicht nötig.</p>
+                <input id="passkey-login-username" placeholder="Benutzername nur falls nötig (optional)" autocomplete="username webauthn" />
                 <input id="passkey-login-redirect-uri" type="hidden" value="${safeDestinationUri}" />
                 <button id="passkey-login-button" type="button">Mit Passkey anmelden</button>
                 <p id="passkey-login-message" class="meta"></p>
@@ -641,13 +642,20 @@ interface LoggedInBodyOptions {
 function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOptions = {}): string {
     const setupPrompt = options.setupPasskeyPrompt === true;
     const autoRedirectAfterSetup = options.autoRedirectAfterPasskeySetup === true;
-    const setupPromptHtml = setupPrompt
-        ? '<div class="alert">Richten Sie jetzt einen Passkey ein. Danach werden Sie automatisch zur ursprünglichen Seite weitergeleitet.</div>'
-        : '';
+    const setupPromptHtml = setupPrompt ? `
+        <div class="setup-callout">
+            <h2>Bitte jetzt Passkey einrichten</h2>
+            <p>Damit melden Sie sich beim nächsten Mal schnell und ohne Passwort an.</p>
+            <p><strong>Nach der Einrichtung geht es automatisch weiter.</strong></p>
+        </div>
+    ` : '';
+    const passkeyIntro = setupPrompt
+        ? 'Einmal auf den Button tippen und den Schritten folgen.'
+        : 'Hier können Sie Ihre Passkey-Anmeldung einrichten oder verwalten.';
     const passkeySection = PASSKEY_ENABLED
         ? `
             <div class="passkey-box">
-                <p class="meta">Passkey für diese Anmeldung einrichten oder verwalten.</p>
+                <p class="passkey-title">${passkeyIntro}</p>
                 <button id="passkey-register-button" type="button">Passkey einrichten</button>
                 <input id="passkey-post-register-redirect-uri" type="hidden" value="${safeDestinationUri}" />
                 <input id="passkey-auto-redirect-after-register" type="hidden" value="${autoRedirectAfterSetup ? '1' : '0'}" />
@@ -658,12 +666,25 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
         `
         : '';
 
+    if (setupPrompt) {
+        return `
+            <h1>Fast geschafft</h1>
+            ${setupPromptHtml}
+            ${passkeySection}
+            <p class="meta login-actions">
+                Falls es gerade nicht möglich ist:
+                <a class="inline-link" href="${safeDestinationUri}">Passkey später einrichten</a>
+            </p>
+            <p class="meta login-actions login-actions--bottom"><a href="/logout">Abmelden</a></p>
+        `;
+    }
+
     return `
         <h1>Angemeldet</h1>
         <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
-        ${setupPromptHtml}
-        <p><a href="${safeDestinationUri}">Zur ursprünglichen Seite</a> oder <a href="/logout">Abmelden</a></p>
+        <p class="login-actions"><a href="${safeDestinationUri}">Zur geschützten Seite</a></p>
         ${passkeySection}
+        <p class="meta login-actions login-actions--bottom"><a href="/logout">Abmelden</a></p>
     `;
 }
 

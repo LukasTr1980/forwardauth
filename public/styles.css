@@ -105,6 +105,11 @@ p {
     color: #6b7280;
     font-size: 0.95rem;
 }
+.passkey-title {
+    margin: 0 0 0.5rem 0;
+    color: #1f2937;
+    font-weight: 600;
+}
 .passkey-box {
     margin-top: 1rem;
     padding-top: 1rem;
@@ -113,6 +118,38 @@ p {
 }
 .passkey-box button {
     margin-top: 0.5rem;
+}
+.setup-callout {
+    text-align: left;
+    border: 2px solid #2563eb;
+    background: #eef4ff;
+    color: #1e3a8a;
+    padding: 1rem;
+    border-radius: 12px;
+    margin: 0 0 1rem 0;
+}
+.setup-callout h2 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.2rem;
+    color: #1e3a8a;
+}
+.setup-callout p {
+    margin: 0.25rem 0;
+}
+.login-actions {
+    margin-bottom: 0.8rem;
+}
+.login-actions a {
+    margin-top: 0;
+}
+.login-actions--bottom {
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid #e5e7eb;
+}
+.inline-link {
+    display: inline;
+    margin-top: 0;
 }
 .passkey-list {
     margin-top: 1rem;
@@ -125,9 +162,6 @@ p {
     border-radius: 10px;
     padding: 0.75rem;
     background: #f9fafb;
-}
-.passkey-item .code {
-    overflow-wrap: anywhere;
 }
 .table-wrapper {
     overflow-x: auto;

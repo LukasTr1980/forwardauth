@@ -210,20 +210,26 @@
         });
     }
 
-    function credentialRowHtml(credential) {
+    function passkeyStorageText(credential) {
+        if (credential && credential.backedUp === true) {
+            return 'Auf mehreren eigenen Geräten verfügbar.';
+        }
+        return 'Auf diesem Gerät gespeichert.';
+    }
+
+    function credentialRowHtml(credential, index) {
         const createdAt = new Date(credential.createdAt).toLocaleString('de-DE');
         const lastUsedAt = new Date(credential.lastUsedAt).toLocaleString('de-DE');
-        const transports = Array.isArray(credential.transports) && credential.transports.length > 0
-            ? credential.transports.join(', ')
-            : 'unbekannt';
+        const title = typeof index === 'number' ? `Passkey ${index}` : 'Passkey';
+        const storageText = passkeyStorageText(credential);
 
         return `
             <div class="passkey-item">
-                <div><strong>ID:</strong> <span class="code">${credential.credentialId}</span></div>
-                <div class="meta">Erstellt: ${createdAt}</div>
+                <div><strong>${title}</strong></div>
+                <div class="meta">Eingerichtet am: ${createdAt}</div>
                 <div class="meta">Zuletzt genutzt: ${lastUsedAt}</div>
-                <div class="meta">Transports: ${transports}</div>
-                <button type="button" class="button--small button--danger" data-credential-id="${credential.credentialId}">Passkey löschen</button>
+                <div class="meta">${storageText}</div>
+                <button type="button" class="button--small button--danger" data-credential-id="${credential.credentialId}">Passkey entfernen</button>
             </div>
         `;
     }
@@ -239,7 +245,7 @@
                 list.innerHTML = '<p class="meta">Noch kein Passkey registriert.</p>';
                 return;
             }
-            list.innerHTML = credentials.map(credentialRowHtml).join('');
+            list.innerHTML = credentials.map((credential, index) => credentialRowHtml(credential, index + 1)).join('');
         } catch (error) {
             list.innerHTML = `<p class="meta" style="color:#b91c1c;">${error instanceof Error ? error.message : 'Fehler beim Laden.'}</p>`;
         }

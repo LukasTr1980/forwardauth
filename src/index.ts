@@ -5,6 +5,16 @@ import { RedisStore, type RedisReply } from 'rate-limit-redis';
 import { createClient, type RedisClientType } from 'redis';
 import * as cookie from 'cookie';
 import { SignJWT, jwtVerify } from 'jose';
+import {
+    generateRegistrationOptions,
+    verifyRegistrationResponse,
+    generateAuthenticationOptions,
+    verifyAuthenticationResponse,
+    type AuthenticationResponseJSON,
+    type RegistrationResponseJSON,
+    type AuthenticatorTransportFuture,
+    type WebAuthnCredential,
+} from '@simplewebauthn/server';
 import argon2 from 'argon2';
 import fs from 'fs/promises';
 import { watchFile, readFileSync } from 'node:fs';
@@ -29,6 +39,30 @@ interface LoginBody {
     username?: string;
     password?: string;
     redirect_uri?: string;
+}
+
+interface PasskeyAuthOptionsBody {
+    username?: string;
+    redirect_uri?: string;
+}
+
+interface PasskeyAuthVerifyBody {
+    flowId?: string;
+    redirect_uri?: string;
+    credential?: AuthenticationResponseJSON;
+}
+
+interface PasskeyRegisterOptionsBody {
+    username?: string;
+}
+
+interface PasskeyRegisterVerifyBody {
+    flowId?: string;
+    credential?: RegistrationResponseJSON;
+}
+
+interface PasskeyCredentialDeleteBody {
+    credentialId?: string;
 }
 
 function getEnvAsNumber(key: string, defaultValue: number): number {
@@ -92,6 +126,41 @@ const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
 const ADULT_PATH_PREFIXES = parseCsvList(process.env.ADULT_PATH_PREFIXES).map(normalizePathPrefix).filter(Boolean);
+const PASSKEY_ENABLED = process.env.PASSKEY_ENABLED === '1' || process.env.PASSKEY_ENABLED === 'true';
+const PASSKEY_RP_ID = process.env.PASSKEY_RP_ID ?? DOMAIN;
+const PASSKEY_RP_NAME = process.env.PASSKEY_RP_NAME ?? BRAND_NAME;
+const PASSKEY_ALLOWED_ORIGINS = parseCsvList(process.env.PASSKEY_ORIGIN).length > 0
+    ? parseCsvList(process.env.PASSKEY_ORIGIN)
+    : [AUTH_ORIGIN];
+const PASSKEY_CHALLENGE_TTL_S = getEnvAsNumber('PASSKEY_CHALLENGE_TTL_S', 120);
+const PASSKEY_LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_LOGIN_LIMITER_WINDOW_S', 15 * 60);
+const PASSKEY_REGISTER_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_REGISTER_LIMITER_WINDOW_S', 15 * 60);
+const PASSKEY_LOGIN_LIMITER_MAX = getEnvAsNumber('PASSKEY_LOGIN_LIMITER_MAX', 30);
+const PASSKEY_REGISTER_LIMITER_MAX = getEnvAsNumber('PASSKEY_REGISTER_LIMITER_MAX', 20);
+
+function isRpIdAllowedForOrigin(rpId: string, origin: string): boolean {
+    try {
+        const host = new URL(origin).hostname.toLowerCase();
+        const normalizedRpId = rpId.toLowerCase();
+        return host === normalizedRpId || host.endsWith(`.${normalizedRpId}`);
+    } catch {
+        return false;
+    }
+}
+
+if (PASSKEY_ENABLED) {
+    if (!PASSKEY_RP_ID) {
+        logger.error('[config] FATAL: PASSKEY_ENABLED requires PASSKEY_RP_ID or DOMAIN.');
+        process.exit(1);
+    }
+
+    for (const origin of PASSKEY_ALLOWED_ORIGINS) {
+        if (!isRpIdAllowedForOrigin(PASSKEY_RP_ID, origin)) {
+            logger.error(`[config] FATAL: PASSKEY origin "${origin}" is not compatible with RP ID "${PASSKEY_RP_ID}".`);
+            process.exit(1);
+        }
+    }
+}
 
 
 function getEnvSecret(key: string, fileKey: string): string | undefined {
@@ -125,6 +194,8 @@ let loginStore: RateLimitStore;
 let verifyStore: RateLimitStore;
 let authPageStore: RateLimitStore;
 let adminLastSeenStore: RateLimitStore;
+let passkeyAuthStore: RateLimitStore;
+let passkeyRegisterStore: RateLimitStore;
 
 if (REDIS_URL) {
     redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD });
@@ -159,16 +230,27 @@ function logStartupConfig(): void {
             verifyLimiterWindowS: VERIFY_LIMITER_WINDOW_S,
             authPageLimiterWindowS: AUTH_PAGE_LIMITER_WINDOW_S,
             adminLastSeenLimiterWindowS: ADMIN_LAST_SEEN_LIMITER_WINDOW_S,
+            passkeyLoginLimiterWindowS: PASSKEY_LOGIN_LIMITER_WINDOW_S,
+            passkeyRegisterLimiterWindowS: PASSKEY_REGISTER_LIMITER_WINDOW_S,
         },
         limits: {
             loginLimiterMax: LOGIN_LIMITER_MAX,
             verifyLimiterMax: VERIFY_LIMITER_MAX,
             authPageLimiterMax: AUTH_PAGE_LIMITER_MAX,
             adminLastSeenLimiterMax: ADMIN_LAST_SEEN_LIMITER_MAX,
+            passkeyLoginLimiterMax: PASSKEY_LOGIN_LIMITER_MAX,
+            passkeyRegisterLimiterMax: PASSKEY_REGISTER_LIMITER_MAX,
         },
         users: {
             file: USER_FILE,
             watchIntervalMs: USER_FILE_WATCH_INTERVAL_MS,
+        },
+        passkey: {
+            enabled: PASSKEY_ENABLED,
+            rpId: PASSKEY_RP_ID ?? '(unset)',
+            rpName: PASSKEY_RP_NAME,
+            challengeTtlS: PASSKEY_CHALLENGE_TTL_S,
+            origins: PASSKEY_ALLOWED_ORIGINS,
         },
         adult: {
             pathPrefixes: ADULT_PATH_PREFIXES,
@@ -246,6 +328,8 @@ let loginLimiter: RequestHandler;
 let verifyLimiter: RequestHandler;
 let authPageLimiter: RequestHandler;
 let adminLastSeenLimiter: RequestHandler;
+let passkeyAuthLimiter: RequestHandler;
+let passkeyRegisterLimiter: RequestHandler;
 
 // Toast page removed
 
@@ -508,7 +592,63 @@ const getPageHTML = (title: string, body: string, options: { containerClass?: st
     `;
 };
 
+function getSessionCookieOptions(): cookie.SerializeOptions {
+    const options: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'lax', path: '/' };
+    if (DOMAIN) {
+        options.domain = DOMAIN;
+    }
+    return options;
+}
+
+function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): string {
+    const passkeySection = PASSKEY_ENABLED
+        ? `
+            <div class="passkey-box">
+                <p class="meta">Oder mit Passkey anmelden</p>
+                <input id="passkey-login-username" placeholder="Benutzername" autocomplete="username webauthn" />
+                <input id="passkey-login-redirect-uri" type="hidden" value="${safeDestinationUri}" />
+                <button id="passkey-login-button" type="button">Mit Passkey anmelden</button>
+                <p id="passkey-login-message" class="meta"></p>
+            </div>
+            <script src="/passkey.js" defer></script>
+        `
+        : '';
+
+    return `
+        ${headlineHtml}
+        <form method="post" action="${AUTH_ORIGIN}/auth">
+            <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
+            <input name="username" placeholder="Benutzername" required autocomplete="username" />
+            <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
+            <button type="submit">Anmelden</button>
+        </form>
+        ${passkeySection}
+    `;
+}
+
+function buildLoggedInBody(safeDestinationUri: string): string {
+    const passkeySection = PASSKEY_ENABLED
+        ? `
+            <div class="passkey-box">
+                <p class="meta">Passkey für diese Anmeldung einrichten oder verwalten.</p>
+                <button id="passkey-register-button" type="button">Passkey einrichten</button>
+                <p id="passkey-register-message" class="meta"></p>
+                <div id="passkey-credential-list" class="passkey-list"></div>
+            </div>
+            <script src="/passkey.js" defer></script>
+        `
+        : '';
+
+    return `
+        <h1>Angemeldet</h1>
+        <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
+        <p><a href="${safeDestinationUri}">Zur ursprünglichen Seite</a> oder <a href="/logout">Abmelden</a></p>
+        ${passkeySection}
+    `;
+}
+
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: '100kb' }));
 app.use(express.static('public'));
 
 // -----------------------------
@@ -718,8 +858,8 @@ async function scanKeys(pattern: string, count = 200): Promise<string[]> {
     return keys;
 }
 
-function parseZsetWithScores(raw: string[] | RedisReply): { value: string; score: number }[] {
-    if (!Array.isArray(raw)) return [];
+function parseZsetWithScores(raw: unknown): { value: string; score: number }[] {
+    if (!isUnknownArray(raw)) return [];
     const results: { value: string; score: number }[] = [];
     for (let i = 0; i < raw.length; i += 2) {
         const value = raw[i];
@@ -820,27 +960,226 @@ async function cleanupOrphanedSessions(): Promise<{ users: number; scanned: numb
     return { users: usersTouched, scanned, removed };
 }
 
-async function authenticateAdmin(req: Request): Promise<string | null> {
-    const cookies = cookie.parse(req.headers.cookie ?? '');
-    const sessionToken = cookies[COOKIE_NAME];
-    if (sessionToken) {
-        try {
-            const { payload } = await jwtVerify(sessionToken, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
-            if (typeof payload.sub === 'string') {
-                const user = users[payload.sub];
-                if (user?.isAdmin) {
-                    if (typeof payload.jti === 'string') {
-                        const active = await sessionStore.isActive(payload.sub, payload.jti);
-                        if (!active) return null;
-                    }
-                    return payload.sub;
-                }
-            }
-        } catch {
-            // fall through to token-based auth
+const PASSKEY_USER_PREFIX = 'passkey:user:';
+const PASSKEY_CRED_PREFIX = 'passkey:cred:';
+const PASSKEY_CHALLENGE_REG_PREFIX = 'passkey:challenge:reg:';
+const PASSKEY_CHALLENGE_AUTH_PREFIX = 'passkey:challenge:auth:';
+
+type PasskeyChallengeKind = 'reg' | 'auth';
+
+interface StoredPasskeyCredential {
+    credentialId: string;
+    publicKey: string;
+    counter: number;
+    transports?: AuthenticatorTransportFuture[];
+    createdAt: number;
+    lastUsedAt: number;
+    deviceType?: string;
+    backedUp?: boolean;
+}
+
+interface StoredPasskeyChallenge {
+    flowId: string;
+    challenge: string;
+    username: string;
+    redirectUri?: string;
+    createdAt: number;
+}
+
+interface AuthenticatedSession {
+    user: string;
+    jti: string;
+}
+
+function passkeyUserKey(username: string): string {
+    return `${PASSKEY_USER_PREFIX}${username}`;
+}
+
+function passkeyCredentialKey(credentialId: string): string {
+    return `${PASSKEY_CRED_PREFIX}${credentialId}`;
+}
+
+function passkeyChallengeKey(kind: PasskeyChallengeKind, flowId: string): string {
+    return kind === 'reg'
+        ? `${PASSKEY_CHALLENGE_REG_PREFIX}${flowId}`
+        : `${PASSKEY_CHALLENGE_AUTH_PREFIX}${flowId}`;
+}
+
+function redactedCredentialId(credentialId: string): string {
+    if (credentialId.length <= 12) return credentialId;
+    return `${credentialId.slice(0, 12)}...`;
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+    return Buffer.from(bytes).toString('base64url');
+}
+
+function base64UrlToBytes(value: string): ReturnType<Uint8Array['slice']> {
+    const bytes = Uint8Array.from(Buffer.from(value, 'base64url'));
+    return bytes.slice();
+}
+
+function isTransport(value: string): value is AuthenticatorTransportFuture {
+    return (
+        value === 'ble' ||
+        value === 'cable' ||
+        value === 'hybrid' ||
+        value === 'internal' ||
+        value === 'nfc' ||
+        value === 'smart-card' ||
+        value === 'usb'
+    );
+}
+
+function parseStoredPasskeyCredential(raw: string): StoredPasskeyCredential | null {
+    try {
+        const parsed = JSON.parse(raw) as Partial<StoredPasskeyCredential>;
+        if (
+            typeof parsed.credentialId !== 'string' ||
+            typeof parsed.publicKey !== 'string' ||
+            typeof parsed.counter !== 'number' ||
+            typeof parsed.createdAt !== 'number' ||
+            typeof parsed.lastUsedAt !== 'number'
+        ) {
+            return null;
+        }
+
+        const transports = Array.isArray(parsed.transports)
+            ? parsed.transports.filter((item): item is AuthenticatorTransportFuture => typeof item === 'string' && isTransport(item))
+            : undefined;
+
+        return {
+            credentialId: parsed.credentialId,
+            publicKey: parsed.publicKey,
+            counter: parsed.counter,
+            createdAt: parsed.createdAt,
+            lastUsedAt: parsed.lastUsedAt,
+            transports,
+            deviceType: typeof parsed.deviceType === 'string' ? parsed.deviceType : undefined,
+            backedUp: typeof parsed.backedUp === 'boolean' ? parsed.backedUp : undefined,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function parseStoredPasskeyChallenge(raw: string): StoredPasskeyChallenge | null {
+    try {
+        const parsed = JSON.parse(raw) as Partial<StoredPasskeyChallenge>;
+        if (
+            typeof parsed.flowId !== 'string' ||
+            typeof parsed.challenge !== 'string' ||
+            typeof parsed.username !== 'string' ||
+            typeof parsed.createdAt !== 'number'
+        ) {
+            return null;
+        }
+
+        return {
+            flowId: parsed.flowId,
+            challenge: parsed.challenge,
+            username: parsed.username,
+            redirectUri: typeof parsed.redirectUri === 'string' ? parsed.redirectUri : undefined,
+            createdAt: parsed.createdAt,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function getPasskeyExpectedOrigins(): string | string[] {
+    return PASSKEY_ALLOWED_ORIGINS.length === 1 ? PASSKEY_ALLOWED_ORIGINS[0] : PASSKEY_ALLOWED_ORIGINS;
+}
+
+async function getPasskeyCredentialsForUser(username: string): Promise<StoredPasskeyCredential[]> {
+    const rawMap = await redisClient.hGetAll(passkeyUserKey(username));
+    const parsed = Object.values(rawMap)
+        .map((raw) => parseStoredPasskeyCredential(raw))
+        .filter((item): item is StoredPasskeyCredential => item !== null);
+    parsed.sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+    return parsed;
+}
+
+async function getPasskeyCredentialForUser(username: string, credentialId: string): Promise<StoredPasskeyCredential | null> {
+    const raw = await redisClient.hGet(passkeyUserKey(username), credentialId);
+    if (!raw) return null;
+    return parseStoredPasskeyCredential(raw);
+}
+
+async function savePasskeyCredentialForUser(username: string, credential: StoredPasskeyCredential): Promise<boolean> {
+    const credentialKey = passkeyCredentialKey(credential.credentialId);
+    const existingOwner = await redisClient.get(credentialKey);
+    if (existingOwner && existingOwner !== username) {
+        return false;
+    }
+
+    if (!existingOwner) {
+        const reserved = await redisClient.set(credentialKey, username, { NX: true });
+        if (reserved !== 'OK') {
+            return false;
         }
     }
-    return null;
+
+    await redisClient.hSet(passkeyUserKey(username), credential.credentialId, JSON.stringify(credential));
+    return true;
+}
+
+async function deletePasskeyCredentialForUser(username: string, credentialId: string): Promise<boolean> {
+    const removed = await redisClient.hDel(passkeyUserKey(username), credentialId);
+    if (removed === 0) return false;
+
+    const credentialKey = passkeyCredentialKey(credentialId);
+    const owner = await redisClient.get(credentialKey);
+    if (owner === username) {
+        await redisClient.del(credentialKey);
+    }
+    return true;
+}
+
+async function storePasskeyChallenge(kind: PasskeyChallengeKind, challenge: StoredPasskeyChallenge): Promise<void> {
+    await redisClient.set(
+        passkeyChallengeKey(kind, challenge.flowId),
+        JSON.stringify(challenge),
+        { EX: PASSKEY_CHALLENGE_TTL_S, NX: true },
+    );
+}
+
+async function consumePasskeyChallenge(kind: PasskeyChallengeKind, flowId: string): Promise<StoredPasskeyChallenge | null> {
+    const raw = await redisClient.getDel(passkeyChallengeKey(kind, flowId));
+    if (!raw) return null;
+    return parseStoredPasskeyChallenge(raw);
+}
+
+async function authenticateSession(req: Request): Promise<AuthenticatedSession | null> {
+    const cookies = cookie.parse(req.headers.cookie ?? '');
+    const sessionToken = cookies[COOKIE_NAME];
+    if (!sessionToken) return null;
+
+    try {
+        const { payload } = await jwtVerify(sessionToken, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+        if (typeof payload.sub !== 'string' || typeof payload.jti !== 'string') {
+            return null;
+        }
+
+        if (!users[payload.sub]) {
+            return null;
+        }
+
+        const active = await sessionStore.isActive(payload.sub, payload.jti);
+        if (!active) {
+            return null;
+        }
+
+        return { user: payload.sub, jti: payload.jti };
+    } catch {
+        return null;
+    }
+}
+
+async function authenticateAdmin(req: Request): Promise<string | null> {
+    const auth = await authenticateSession(req);
+    if (!auth) return null;
+    return users[auth.user]?.isAdmin ? auth.user : null;
 }
 
 const verifyHandler: RequestHandler = async (req, res) => {
@@ -1010,6 +1349,414 @@ const statusHandler: RequestHandler = async (req, res) => {
     }
 };
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function getRequiredTrimmedString(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function isRegistrationResponseJson(value: unknown): value is RegistrationResponseJSON {
+    if (!isObjectRecord(value)) return false;
+    if (typeof value.id !== 'string' || typeof value.rawId !== 'string' || value.type !== 'public-key') return false;
+    if (!isObjectRecord(value.response)) return false;
+
+    const response = value.response;
+    return (
+        typeof response.clientDataJSON === 'string' &&
+        typeof response.attestationObject === 'string'
+    );
+}
+
+function isAuthenticationResponseJson(value: unknown): value is AuthenticationResponseJSON {
+    if (!isObjectRecord(value)) return false;
+    if (typeof value.id !== 'string' || typeof value.rawId !== 'string' || value.type !== 'public-key') return false;
+    if (!isObjectRecord(value.response)) return false;
+
+    const response = value.response;
+    return (
+        typeof response.clientDataJSON === 'string' &&
+        typeof response.authenticatorData === 'string' &&
+        typeof response.signature === 'string'
+    );
+}
+
+const passkeyRegisterOptionsHandler: RequestHandler<ParamsDictionary, unknown, PasskeyRegisterOptionsBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!PASSKEY_ENABLED) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[passkey] Cross-site register/options blocked from IP ${req.ip}`);
+        res.status(403).json({ error: 'Ungültige Anfrageherkunft.' });
+        return;
+    }
+
+    const auth = await authenticateSession(req as Request);
+    if (!auth) {
+        res.status(401).json({ error: 'Nicht angemeldet.' });
+        return;
+    }
+
+    if (req.body?.username && req.body.username !== auth.user) {
+        res.status(403).json({ error: 'Benutzer stimmt nicht mit aktiver Sitzung überein.' });
+        return;
+    }
+
+    const existingCredentials = await getPasskeyCredentialsForUser(auth.user);
+    const options = await generateRegistrationOptions({
+        rpName: PASSKEY_RP_NAME,
+        rpID: PASSKEY_RP_ID ?? '',
+        userName: auth.user,
+        userID: new TextEncoder().encode(auth.user),
+        userDisplayName: auth.user,
+        attestationType: 'none',
+        authenticatorSelection: {
+            residentKey: 'preferred',
+            userVerification: 'required',
+        },
+        excludeCredentials: existingCredentials.map((credential) => ({
+            id: credential.credentialId,
+            transports: credential.transports,
+        })),
+    });
+
+    const flowId = randomUUID();
+    await storePasskeyChallenge('reg', {
+        flowId,
+        challenge: options.challenge,
+        username: auth.user,
+        createdAt: Date.now(),
+    });
+
+    logger.info(`[passkey] registration options issued for user "${auth.user}"`);
+    res.status(200).json({ flowId, options });
+};
+
+const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, PasskeyRegisterVerifyBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!PASSKEY_ENABLED) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[passkey] Cross-site register/verify blocked from IP ${req.ip}`);
+        res.status(403).json({ error: 'Ungültige Anfrageherkunft.' });
+        return;
+    }
+
+    const auth = await authenticateSession(req as Request);
+    if (!auth) {
+        res.status(401).json({ error: 'Nicht angemeldet.' });
+        return;
+    }
+
+    const flowId = getRequiredTrimmedString(req.body?.flowId);
+    if (!flowId) {
+        res.status(400).json({ error: 'flowId fehlt.' });
+        return;
+    }
+
+    if (!isRegistrationResponseJson(req.body?.credential)) {
+        res.status(400).json({ error: 'Ungültige Registrierung-Antwort.' });
+        return;
+    }
+
+    const challengeState = await consumePasskeyChallenge('reg', flowId);
+    if (!challengeState) {
+        res.status(400).json({ error: 'Challenge abgelaufen oder bereits verwendet.' });
+        return;
+    }
+
+    if (challengeState.username !== auth.user) {
+        res.status(403).json({ error: 'Challenge passt nicht zum aktiven Benutzer.' });
+        return;
+    }
+
+    try {
+        const verification = await verifyRegistrationResponse({
+            response: req.body.credential,
+            expectedChallenge: challengeState.challenge,
+            expectedOrigin: getPasskeyExpectedOrigins(),
+            expectedRPID: PASSKEY_RP_ID ?? '',
+            requireUserVerification: true,
+        });
+
+        if (!verification.verified || !verification.registrationInfo) {
+            res.status(400).json({ error: 'Passkey-Verifizierung fehlgeschlagen.' });
+            return;
+        }
+
+        const now = Date.now();
+        const registrationInfo = verification.registrationInfo;
+        const credential: StoredPasskeyCredential = {
+            credentialId: registrationInfo.credential.id,
+            publicKey: bytesToBase64Url(registrationInfo.credential.publicKey),
+            counter: registrationInfo.credential.counter,
+            transports: req.body.credential.response.transports?.filter(isTransport),
+            createdAt: now,
+            lastUsedAt: now,
+            deviceType: registrationInfo.credentialDeviceType,
+            backedUp: registrationInfo.credentialBackedUp,
+        };
+
+        const saved = await savePasskeyCredentialForUser(auth.user, credential);
+        if (!saved) {
+            logger.warn(`[passkey] Credential collision on registration for user "${auth.user}" (${redactedCredentialId(credential.credentialId)})`);
+            res.status(409).json({ error: 'Passkey ist bereits für einen anderen Benutzer registriert.' });
+            return;
+        }
+
+        logger.info(`[passkey] registration success for user "${auth.user}" (${redactedCredentialId(credential.credentialId)})`);
+        res.status(200).json({ ok: true });
+    } catch (error) {
+        logger.warn(`[passkey] registration verify failed for user "${auth.user}": ${(error as Error).message}`);
+        res.status(400).json({ error: 'Passkey-Verifizierung fehlgeschlagen.' });
+    }
+};
+
+const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, PasskeyAuthOptionsBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!PASSKEY_ENABLED) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[passkey] Cross-site auth/options blocked from IP ${req.ip}`);
+        res.status(403).json({ error: 'Ungültige Anfrageherkunft.' });
+        return;
+    }
+
+    const username = getRequiredTrimmedString(req.body?.username);
+    if (!username) {
+        res.status(400).json({ error: 'Benutzername fehlt.' });
+        return;
+    }
+
+    const userRecord = users[username];
+    if (!userRecord) {
+        res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
+        return;
+    }
+
+    const storedCredentials = await getPasskeyCredentialsForUser(username);
+    if (storedCredentials.length === 0) {
+        res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
+        return;
+    }
+
+    const options = await generateAuthenticationOptions({
+        rpID: PASSKEY_RP_ID ?? '',
+        userVerification: 'required',
+        allowCredentials: storedCredentials.map((credential) => ({
+            id: credential.credentialId,
+            transports: credential.transports,
+        })),
+    });
+
+    const flowId = randomUUID();
+    const redirectUri = validateRedirectUri(req.body?.redirect_uri ?? '/');
+    await storePasskeyChallenge('auth', {
+        flowId,
+        challenge: options.challenge,
+        username,
+        redirectUri,
+        createdAt: Date.now(),
+    });
+
+    logger.info(`[passkey] authentication options issued for user "${username}"`);
+    res.status(200).json({ flowId, options });
+};
+
+const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, PasskeyAuthVerifyBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!PASSKEY_ENABLED) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[passkey] Cross-site auth/verify blocked from IP ${req.ip}`);
+        res.status(403).json({ error: 'Ungültige Anfrageherkunft.' });
+        return;
+    }
+
+    const flowId = getRequiredTrimmedString(req.body?.flowId);
+    if (!flowId) {
+        res.status(400).json({ error: 'flowId fehlt.' });
+        return;
+    }
+
+    if (!isAuthenticationResponseJson(req.body?.credential)) {
+        res.status(400).json({ error: 'Ungültige Anmelde-Antwort.' });
+        return;
+    }
+
+    const challengeState = await consumePasskeyChallenge('auth', flowId);
+    if (!challengeState) {
+        res.status(400).json({ error: 'Challenge abgelaufen oder bereits verwendet.' });
+        return;
+    }
+
+    const username = challengeState.username;
+    if (!users[username]) {
+        res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
+        return;
+    }
+    const storedCredential = await getPasskeyCredentialForUser(username, req.body.credential.id);
+    if (!storedCredential) {
+        logger.warn(`[passkey] auth verify failed: unknown credential for "${username}"`);
+        res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
+        return;
+    }
+
+    const credential: WebAuthnCredential = {
+        id: storedCredential.credentialId,
+        publicKey: base64UrlToBytes(storedCredential.publicKey),
+        counter: storedCredential.counter,
+        transports: storedCredential.transports,
+    };
+
+    try {
+        const verification = await verifyAuthenticationResponse({
+            response: req.body.credential,
+            expectedChallenge: challengeState.challenge,
+            expectedOrigin: getPasskeyExpectedOrigins(),
+            expectedRPID: PASSKEY_RP_ID ?? '',
+            credential,
+            requireUserVerification: true,
+        });
+
+        if (!verification.verified) {
+            res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
+            return;
+        }
+
+        const now = Date.now();
+        const updatedCredential: StoredPasskeyCredential = {
+            ...storedCredential,
+            counter: verification.authenticationInfo.newCounter,
+            lastUsedAt: now,
+            deviceType: verification.authenticationInfo.credentialDeviceType,
+            backedUp: verification.authenticationInfo.credentialBackedUp,
+        };
+        const saved = await savePasskeyCredentialForUser(username, updatedCredential);
+        if (!saved) {
+            res.status(409).json({ error: 'Credential-Zuordnung ist nicht mehr gültig.' });
+            return;
+        }
+
+        const jti = randomUUID();
+        await sessionStore.addSession(username, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
+
+        const jwt = await new SignJWT({})
+            .setProtectedHeader({ alg: 'HS256' })
+            .setIssuer(JWT_ISSUER)
+            .setSubject(username)
+            .setJti(jti)
+            .setIssuedAt()
+            .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
+            .sign(JWT_SECRET);
+
+        res.setHeader('Set-Cookie', [
+            cookie.serialize(COOKIE_NAME, jwt, getSessionCookieOptions()),
+        ]);
+
+        void recordLastSeen(username, {
+            ip: req.ip ?? 'unknown',
+            host: req.hostname || 'unknown',
+            uri: challengeState.redirectUri ?? '/',
+            userAgent: getHeaderString(req as Request, 'user-agent') || 'unknown',
+            platform: getHeaderString(req as Request, 'sec-ch-ua-platform') || undefined,
+            via: 'login',
+            jti,
+        });
+
+        logger.info(`[passkey] authentication success for user "${username}" (${redactedCredentialId(storedCredential.credentialId)})`);
+        res.status(200).json({
+            ok: true,
+            redirectTo: validateRedirectUri(req.body?.redirect_uri ?? challengeState.redirectUri ?? '/'),
+        });
+    } catch (error) {
+        logger.warn(`[passkey] auth verify failed for "${username}": ${(error as Error).message}`);
+        res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
+    }
+};
+
+const passkeyCredentialsHandler: RequestHandler = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!PASSKEY_ENABLED) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+    }
+
+    const auth = await authenticateSession(req as Request);
+    if (!auth) {
+        res.status(401).json({ error: 'Nicht angemeldet.' });
+        return;
+    }
+
+    const credentials = await getPasskeyCredentialsForUser(auth.user);
+    res.status(200).json({
+        credentials: credentials.map((credential) => ({
+            credentialId: credential.credentialId,
+            createdAt: credential.createdAt,
+            lastUsedAt: credential.lastUsedAt,
+            transports: credential.transports ?? [],
+            deviceType: credential.deviceType ?? 'unknown',
+            backedUp: credential.backedUp ?? false,
+        })),
+    });
+};
+
+const passkeyCredentialDeleteHandler: RequestHandler<ParamsDictionary, unknown, PasskeyCredentialDeleteBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!PASSKEY_ENABLED) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[passkey] Cross-site credential/delete blocked from IP ${req.ip}`);
+        res.status(403).json({ error: 'Ungültige Anfrageherkunft.' });
+        return;
+    }
+
+    const auth = await authenticateSession(req as Request);
+    if (!auth) {
+        res.status(401).json({ error: 'Nicht angemeldet.' });
+        return;
+    }
+
+    const credentialId = getRequiredTrimmedString(req.body?.credentialId);
+    if (!credentialId) {
+        res.status(400).json({ error: 'credentialId fehlt.' });
+        return;
+    }
+
+    const removed = await deletePasskeyCredentialForUser(auth.user, credentialId);
+    if (!removed) {
+        res.status(404).json({ error: 'Passkey nicht gefunden.' });
+        return;
+    }
+
+    logger.info(`[passkey] credential deleted for "${auth.user}" (${redactedCredentialId(credentialId)})`);
+    res.status(200).json({ ok: true });
+};
+
 const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>, string, LoginBody, LoginQuery> = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
@@ -1058,15 +1805,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     if (!allowed) {
                         logger.warn(`[auth] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
                         const message = '<div class="alert alert--error">Zu viele aktive Sitzungen für dieses Konto. Bitte melden Sie sich auf einem anderen Gerät ab und versuchen Sie es erneut.</div>';
-                        const loginFormBody = `
-                            ${message}
-                            <form method="post" action="${AUTH_ORIGIN}/auth">
-                                <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-                                <input name="username" placeholder="Benutzername" required autocomplete="username" />
-                                <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
-                                <button type="submit">Anmelden</button>
-                            </form>
-                        `;
+                        const loginFormBody = buildLoginFormBody(safeDestinationUri, `${message}<h1>Bitte anmelden</h1>`);
                         res.status(429).send(getPageHTML('Zu viele Sitzungen', loginFormBody));
                         return;
                     }
@@ -1080,12 +1819,8 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
                         .sign(JWT_SECRET);
 
-                    // Use SameSite Lax to maximize compatibility across subdomain navigations
-                    const sessionCookieOptions: cookie.SerializeOptions = { httpOnly: true, secure: true, maxAge: COOKIE_MAX_AGE_S, sameSite: 'lax', path: '/' };
-                    if (DOMAIN) sessionCookieOptions.domain = DOMAIN;
-
                     res.setHeader('Set-Cookie', [
-                        cookie.serialize(COOKIE_NAME, jwt, sessionCookieOptions)
+                        cookie.serialize(COOKIE_NAME, jwt, getSessionCookieOptions())
                     ]);
 
                     const lastSeenHost = requestHost || req.hostname || 'unknown';
@@ -1130,25 +1865,13 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                 ]);
 
                 const message = '<div class="alert alert--error">Sie wurden auf diesem Gerät abgemeldet, weil Sie sich an einem anderen Ort angemeldet haben. Bitte melden Sie sich erneut an.</div>';
-                const loginFormBody = `
-                    ${message}
-                    <form method="post" action="${AUTH_ORIGIN}/auth">
-                        <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-                        <input name="username" placeholder="Benutzername" required autocomplete="username" />
-                        <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
-                        <button type="submit">Anmelden</button>
-                    </form>
-                `;
+                const loginFormBody = buildLoginFormBody(safeDestinationUri, `${message}<h1>Bitte anmelden</h1>`);
                 res.status(401).send(getPageHTML('Anmeldung', loginFormBody));
                 return;
             }
         }
 
-        const loggedInBody = `
-            <h1>Angemeldet</h1>
-            <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
-            <p><a href="${safeDestinationUri}">Zur ursprünglichen Seite</a> oder <a href="/logout">Abmelden</a></p>
-        `;
+        const loggedInBody = buildLoggedInBody(safeDestinationUri);
         res.status(200).send(getPageHTML('Angemeldet', loggedInBody));
         return;
     } catch {
@@ -1158,15 +1881,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             ? '<div class="alert alert--error">Ungültiger Benutzername oder Passwort.</div><h1>Bitte anmelden</h1>'
             : '<h1>Bitte anmelden</h1>';
 
-        const loginFormBody = `
-            ${loginMessage}
-            <form method="post" action="${AUTH_ORIGIN}/auth">
-                <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-                <input name="username" placeholder="Benutzername" required autocomplete="username" />
-                <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
-                <button type="submit">Anmelden</button>
-            </form>
-        `;
+        const loginFormBody = buildLoginFormBody(safeDestinationUri, loginMessage);
 
         res.status(401).send(getPageHTML('Anmeldung', loginFormBody));
     }
@@ -1476,6 +2191,8 @@ void (async () => {
         verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
         authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
         adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
+        passkeyAuthStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-auth:' });
+        passkeyRegisterStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-register:' });
 
         // Initialize rate limiters with Redis store
         loginLimiter = rateLimit({
@@ -1510,6 +2227,22 @@ void (async () => {
             message: 'Zu viele Admin-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
             store: adminLastSeenStore,
         });
+        passkeyAuthLimiter = rateLimit({
+            windowMs: PASSKEY_LOGIN_LIMITER_WINDOW_S * 1000,
+            limit: PASSKEY_LOGIN_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Passkey-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
+            store: passkeyAuthStore,
+        });
+        passkeyRegisterLimiter = rateLimit({
+            windowMs: PASSKEY_REGISTER_LIMITER_WINDOW_S * 1000,
+            limit: PASSKEY_REGISTER_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Passkey-Registrierungsanfragen von dieser IP. Bitte versuchen Sie es später erneut.',
+            store: passkeyRegisterStore,
+        });
 
         // Initialize session store (Redis only)
         sessionStore = new RedisSessionStore(redisClient);
@@ -1522,12 +2255,19 @@ void (async () => {
         app.post('/auth', loginLimiter, loginPageHandler);
         app.get('/auth', authPageLimiter, loginPageHandler);
         app.get('/auth/status', verifyLimiter, statusHandler);
+        app.post('/passkey/register/options', passkeyRegisterLimiter, passkeyRegisterOptionsHandler);
+        app.post('/passkey/register/verify', passkeyRegisterLimiter, passkeyRegisterVerifyHandler);
+        app.post('/passkey/auth/options', passkeyAuthLimiter, passkeyAuthOptionsHandler);
+        app.post('/passkey/auth/verify', passkeyAuthLimiter, passkeyAuthVerifyHandler);
+        app.get('/passkey/credentials', passkeyRegisterLimiter, passkeyCredentialsHandler);
+        app.post('/passkey/credentials/delete', passkeyRegisterLimiter, passkeyCredentialDeleteHandler);
         app.get('/logout', logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);
         app.get('/admin/last-seen', adminLastSeenLimiter, adminLastSeenHandler);
         app.get('/admin/sessions', adminLastSeenLimiter, adminSessionsHandler);
         app.post('/admin/sessions/revoke', adminLastSeenLimiter, adminSessionsRevokeHandler);
         app.post('/admin/sessions/cleanup', adminLastSeenLimiter, adminSessionsCleanupHandler);
+        logger.info(`[passkey] endpoints ${PASSKEY_ENABLED ? 'enabled' : 'disabled'} (feature flag PASSKEY_ENABLED)`);
         logger.info('[admin] /admin/last-seen enabled (admin session required)');
         logger.info('[admin] /admin/sessions enabled (admin session required)');
 

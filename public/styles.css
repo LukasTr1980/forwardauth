@@ -105,6 +105,30 @@ p {
     color: #6b7280;
     font-size: 0.95rem;
 }
+.passkey-box {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid #e5e7eb;
+    text-align: left;
+}
+.passkey-box button {
+    margin-top: 0.5rem;
+}
+.passkey-list {
+    margin-top: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+.passkey-item {
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 0.75rem;
+    background: #f9fafb;
+}
+.passkey-item .code {
+    overflow-wrap: anywhere;
+}
 .table-wrapper {
     overflow-x: auto;
     margin-top: 1rem;

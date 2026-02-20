@@ -26,15 +26,17 @@
     "rel:major": "npm version major --no-git-tag-version"
   },
   "dependencies": {
+    "@simplewebauthn/browser": "^13.2.2",
+    "@simplewebauthn/server": "^13.2.2",
     "argon2": "^0.44.0",
     "cookie": "^1.0.2",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
-    "rate-limit-redis": "^4.2.3",
-    "redis": "^5.9.0",
     "he": "^1.2.0",
     "helmet": "^8.1.0",
     "jose": "^6.0.11",
+    "rate-limit-redis": "^4.2.3",
+    "redis": "^5.9.0",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"
   },

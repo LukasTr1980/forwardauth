@@ -33,6 +33,7 @@ interface User {
 
 interface LoginQuery {
     redirect_uri?: string;
+    setup_passkey?: string;
 }
 
 interface LoginBody {
@@ -135,8 +136,10 @@ const PASSKEY_ALLOWED_ORIGINS = parseCsvList(process.env.PASSKEY_ORIGIN).length 
 const PASSKEY_CHALLENGE_TTL_S = getEnvAsNumber('PASSKEY_CHALLENGE_TTL_S', 120);
 const PASSKEY_LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_LOGIN_LIMITER_WINDOW_S', 15 * 60);
 const PASSKEY_REGISTER_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_REGISTER_LIMITER_WINDOW_S', 15 * 60);
+const PASSKEY_CREDENTIALS_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_CREDENTIALS_LIMITER_WINDOW_S', 60);
 const PASSKEY_LOGIN_LIMITER_MAX = getEnvAsNumber('PASSKEY_LOGIN_LIMITER_MAX', 30);
 const PASSKEY_REGISTER_LIMITER_MAX = getEnvAsNumber('PASSKEY_REGISTER_LIMITER_MAX', 20);
+const PASSKEY_CREDENTIALS_LIMITER_MAX = getEnvAsNumber('PASSKEY_CREDENTIALS_LIMITER_MAX', 240);
 
 function isRpIdAllowedForOrigin(rpId: string, origin: string): boolean {
     try {
@@ -196,6 +199,7 @@ let authPageStore: RateLimitStore;
 let adminLastSeenStore: RateLimitStore;
 let passkeyAuthStore: RateLimitStore;
 let passkeyRegisterStore: RateLimitStore;
+let passkeyCredentialsStore: RateLimitStore;
 
 if (REDIS_URL) {
     redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD });
@@ -232,6 +236,7 @@ function logStartupConfig(): void {
             adminLastSeenLimiterWindowS: ADMIN_LAST_SEEN_LIMITER_WINDOW_S,
             passkeyLoginLimiterWindowS: PASSKEY_LOGIN_LIMITER_WINDOW_S,
             passkeyRegisterLimiterWindowS: PASSKEY_REGISTER_LIMITER_WINDOW_S,
+            passkeyCredentialsLimiterWindowS: PASSKEY_CREDENTIALS_LIMITER_WINDOW_S,
         },
         limits: {
             loginLimiterMax: LOGIN_LIMITER_MAX,
@@ -240,6 +245,7 @@ function logStartupConfig(): void {
             adminLastSeenLimiterMax: ADMIN_LAST_SEEN_LIMITER_MAX,
             passkeyLoginLimiterMax: PASSKEY_LOGIN_LIMITER_MAX,
             passkeyRegisterLimiterMax: PASSKEY_REGISTER_LIMITER_MAX,
+            passkeyCredentialsLimiterMax: PASSKEY_CREDENTIALS_LIMITER_MAX,
         },
         users: {
             file: USER_FILE,
@@ -330,6 +336,7 @@ let authPageLimiter: RequestHandler;
 let adminLastSeenLimiter: RequestHandler;
 let passkeyAuthLimiter: RequestHandler;
 let passkeyRegisterLimiter: RequestHandler;
+let passkeyCredentialsLimiter: RequestHandler;
 
 // Toast page removed
 
@@ -604,8 +611,8 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
     const passkeySection = PASSKEY_ENABLED
         ? `
             <div class="passkey-box">
-                <p class="meta">Oder mit Passkey anmelden</p>
-                <input id="passkey-login-username" placeholder="Benutzername" autocomplete="username webauthn" />
+                <p class="meta">Oder mit Passkey anmelden (Discovery-first, Benutzername optional)</p>
+                <input id="passkey-login-username" placeholder="Benutzername (optional)" autocomplete="username webauthn" />
                 <input id="passkey-login-redirect-uri" type="hidden" value="${safeDestinationUri}" />
                 <button id="passkey-login-button" type="button">Mit Passkey anmelden</button>
                 <p id="passkey-login-message" class="meta"></p>
@@ -626,12 +633,24 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
     `;
 }
 
-function buildLoggedInBody(safeDestinationUri: string): string {
+interface LoggedInBodyOptions {
+    setupPasskeyPrompt?: boolean;
+    autoRedirectAfterPasskeySetup?: boolean;
+}
+
+function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOptions = {}): string {
+    const setupPrompt = options.setupPasskeyPrompt === true;
+    const autoRedirectAfterSetup = options.autoRedirectAfterPasskeySetup === true;
+    const setupPromptHtml = setupPrompt
+        ? '<div class="alert">Richten Sie jetzt einen Passkey ein. Danach werden Sie automatisch zur ursprünglichen Seite weitergeleitet.</div>'
+        : '';
     const passkeySection = PASSKEY_ENABLED
         ? `
             <div class="passkey-box">
                 <p class="meta">Passkey für diese Anmeldung einrichten oder verwalten.</p>
                 <button id="passkey-register-button" type="button">Passkey einrichten</button>
+                <input id="passkey-post-register-redirect-uri" type="hidden" value="${safeDestinationUri}" />
+                <input id="passkey-auto-redirect-after-register" type="hidden" value="${autoRedirectAfterSetup ? '1' : '0'}" />
                 <p id="passkey-register-message" class="meta"></p>
                 <div id="passkey-credential-list" class="passkey-list"></div>
             </div>
@@ -642,6 +661,7 @@ function buildLoggedInBody(safeDestinationUri: string): string {
     return `
         <h1>Angemeldet</h1>
         <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
+        ${setupPromptHtml}
         <p><a href="${safeDestinationUri}">Zur ursprünglichen Seite</a> oder <a href="/logout">Abmelden</a></p>
         ${passkeySection}
     `;
@@ -981,7 +1001,7 @@ interface StoredPasskeyCredential {
 interface StoredPasskeyChallenge {
     flowId: string;
     challenge: string;
-    username: string;
+    username?: string;
     redirectUri?: string;
     createdAt: number;
 }
@@ -1069,7 +1089,6 @@ function parseStoredPasskeyChallenge(raw: string): StoredPasskeyChallenge | null
         if (
             typeof parsed.flowId !== 'string' ||
             typeof parsed.challenge !== 'string' ||
-            typeof parsed.username !== 'string' ||
             typeof parsed.createdAt !== 'number'
         ) {
             return null;
@@ -1078,7 +1097,7 @@ function parseStoredPasskeyChallenge(raw: string): StoredPasskeyChallenge | null
         return {
             flowId: parsed.flowId,
             challenge: parsed.challenge,
-            username: parsed.username,
+            username: typeof parsed.username === 'string' ? parsed.username : undefined,
             redirectUri: typeof parsed.redirectUri === 'string' ? parsed.redirectUri : undefined,
             createdAt: parsed.createdAt,
         };
@@ -1104,6 +1123,12 @@ async function getPasskeyCredentialForUser(username: string, credentialId: strin
     const raw = await redisClient.hGet(passkeyUserKey(username), credentialId);
     if (!raw) return null;
     return parseStoredPasskeyCredential(raw);
+}
+
+async function getPasskeyCredentialOwner(credentialId: string): Promise<string | null> {
+    const owner = await redisClient.get(passkeyCredentialKey(credentialId));
+    if (!owner || owner.trim() === '') return null;
+    return owner;
 }
 
 async function savePasskeyCredentialForUser(username: string, credential: StoredPasskeyCredential): Promise<boolean> {
@@ -1537,31 +1562,31 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
         return;
     }
 
-    const username = getRequiredTrimmedString(req.body?.username);
-    if (!username) {
-        res.status(400).json({ error: 'Benutzername fehlt.' });
-        return;
-    }
+    const username = getRequiredTrimmedString(req.body?.username) ?? undefined;
+    let allowCredentials: { id: string; transports?: AuthenticatorTransportFuture[] }[] | undefined;
 
-    const userRecord = users[username];
-    if (!userRecord) {
-        res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
-        return;
-    }
+    if (username) {
+        if (!users[username]) {
+            res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
+            return;
+        }
 
-    const storedCredentials = await getPasskeyCredentialsForUser(username);
-    if (storedCredentials.length === 0) {
-        res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
-        return;
+        const storedCredentials = await getPasskeyCredentialsForUser(username);
+        if (storedCredentials.length === 0) {
+            res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
+            return;
+        }
+
+        allowCredentials = storedCredentials.map((credential) => ({
+            id: credential.credentialId,
+            transports: credential.transports,
+        }));
     }
 
     const options = await generateAuthenticationOptions({
         rpID: PASSKEY_RP_ID ?? '',
         userVerification: 'required',
-        allowCredentials: storedCredentials.map((credential) => ({
-            id: credential.credentialId,
-            transports: credential.transports,
-        })),
+        ...(allowCredentials ? { allowCredentials } : {}),
     });
 
     const flowId = randomUUID();
@@ -1574,7 +1599,7 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
         createdAt: Date.now(),
     });
 
-    logger.info(`[passkey] authentication options issued for user "${username}"`);
+    logger.info(`[passkey] authentication options issued (${username ? `user "${username}"` : 'discovery'})`);
     res.status(200).json({ flowId, options });
 };
 
@@ -1609,12 +1634,23 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         return;
     }
 
-    const username = challengeState.username;
-    if (!users[username]) {
+    let username = challengeState.username;
+    const credentialId = req.body.credential.id;
+    const mappedOwner = await getPasskeyCredentialOwner(credentialId);
+    username ??= mappedOwner ?? undefined;
+
+    if (!username || !users[username]) {
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
-    const storedCredential = await getPasskeyCredentialForUser(username, req.body.credential.id);
+
+    if (mappedOwner && mappedOwner !== username) {
+        logger.warn(`[passkey] auth verify owner mismatch for credential ${redactedCredentialId(credentialId)}`);
+        res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
+        return;
+    }
+
+    const storedCredential = await getPasskeyCredentialForUser(username, credentialId);
     if (!storedCredential) {
         logger.warn(`[passkey] auth verify failed: unknown credential for "${username}"`);
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
@@ -1769,6 +1805,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     const rawRedirectUri = req.query.redirect_uri ?? req.body?.redirect_uri;
     const validatedDestinationUri = validateRedirectUri(rawRedirectUri ?? getOriginalUrl(req as Request));
     const safeDestinationUri = he.encode(validatedDestinationUri);
+    const setupPasskeyRequested = req.query.setup_passkey === '1';
 
     const sourceIp = req.ip ?? 'unknown';
 
@@ -1834,6 +1871,21 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                         jti,
                     });
 
+                    if (PASSKEY_ENABLED) {
+                        try {
+                            const existingPasskeys = await getPasskeyCredentialsForUser(user);
+                            if (existingPasskeys.length === 0) {
+                                const setupPasskeyUrl = new URL(`${AUTH_ORIGIN}/auth`);
+                                setupPasskeyUrl.searchParams.set('redirect_uri', validatedDestinationUri);
+                                setupPasskeyUrl.searchParams.set('setup_passkey', '1');
+                                res.redirect(setupPasskeyUrl.toString());
+                                return;
+                            }
+                        } catch (error) {
+                            logger.warn(`[passkey] Could not check existing passkeys for "${user}", continuing with normal redirect.`, error);
+                        }
+                    }
+
                     res.redirect(validatedDestinationUri);
                     return;
                 }
@@ -1871,7 +1923,20 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             }
         }
 
-        const loggedInBody = buildLoggedInBody(safeDestinationUri);
+        let hasPasskey = false;
+        if (PASSKEY_ENABLED && typeof payload.sub === 'string') {
+            try {
+                hasPasskey = (await getPasskeyCredentialsForUser(payload.sub)).length > 0;
+            } catch (error) {
+                logger.warn(`[passkey] Could not load passkey list for "${payload.sub}"`, error);
+            }
+        }
+
+        const promptPasskeySetup = PASSKEY_ENABLED && setupPasskeyRequested && !hasPasskey;
+        const loggedInBody = buildLoggedInBody(safeDestinationUri, {
+            setupPasskeyPrompt: promptPasskeySetup,
+            autoRedirectAfterPasskeySetup: promptPasskeySetup,
+        });
         res.status(200).send(getPageHTML('Angemeldet', loggedInBody));
         return;
     } catch {
@@ -2193,6 +2258,7 @@ void (async () => {
         adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
         passkeyAuthStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-auth:' });
         passkeyRegisterStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-register:' });
+        passkeyCredentialsStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-credentials:' });
 
         // Initialize rate limiters with Redis store
         loginLimiter = rateLimit({
@@ -2243,6 +2309,14 @@ void (async () => {
             message: 'Zu viele Passkey-Registrierungsanfragen von dieser IP. Bitte versuchen Sie es später erneut.',
             store: passkeyRegisterStore,
         });
+        passkeyCredentialsLimiter = rateLimit({
+            windowMs: PASSKEY_CREDENTIALS_LIMITER_WINDOW_S * 1000,
+            limit: PASSKEY_CREDENTIALS_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Passkey-Abfragen von dieser IP. Bitte versuchen Sie es später erneut.',
+            store: passkeyCredentialsStore,
+        });
 
         // Initialize session store (Redis only)
         sessionStore = new RedisSessionStore(redisClient);
@@ -2259,7 +2333,7 @@ void (async () => {
         app.post('/passkey/register/verify', passkeyRegisterLimiter, passkeyRegisterVerifyHandler);
         app.post('/passkey/auth/options', passkeyAuthLimiter, passkeyAuthOptionsHandler);
         app.post('/passkey/auth/verify', passkeyAuthLimiter, passkeyAuthVerifyHandler);
-        app.get('/passkey/credentials', passkeyRegisterLimiter, passkeyCredentialsHandler);
+        app.get('/passkey/credentials', passkeyCredentialsLimiter, passkeyCredentialsHandler);
         app.post('/passkey/credentials/delete', passkeyRegisterLimiter, passkeyCredentialDeleteHandler);
         app.get('/logout', logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);

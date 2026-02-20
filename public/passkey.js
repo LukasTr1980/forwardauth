@@ -175,20 +175,17 @@
 
         button.addEventListener('click', async () => {
             const username = getLoginUsername();
-            if (!username) {
-                setMessage(message, 'Bitte zuerst einen Benutzernamen eingeben.', true);
-                return;
-            }
-
             const redirectUri = redirectInput && typeof redirectInput.value === 'string' ? redirectInput.value : '/';
             button.disabled = true;
-            setMessage(message, 'Passkey-Anfrage wird gestartet...', false);
+            setMessage(message, username ? 'Passkey-Anfrage wird gestartet...' : 'Passkey-Discovery wird gestartet...', false);
 
             try {
-                const optionsResponse = await postJson('/passkey/auth/options', {
-                    username,
-                    redirect_uri: redirectUri,
-                });
+                const optionsPayload = { redirect_uri: redirectUri };
+                if (username) {
+                    optionsPayload.username = username;
+                }
+
+                const optionsResponse = await postJson('/passkey/auth/options', optionsPayload);
 
                 const publicKey = requestOptionsFromJSON(optionsResponse.options);
                 const assertion = await navigator.credentials.get({ publicKey });
@@ -254,6 +251,8 @@
 
         const message = byId('passkey-register-message');
         const list = byId('passkey-credential-list');
+        const redirectInput = byId('passkey-post-register-redirect-uri');
+        const autoRedirectInput = byId('passkey-auto-redirect-after-register');
 
         if (!supportsPasskey()) {
             button.disabled = true;
@@ -283,6 +282,15 @@
 
                 setMessage(message, 'Passkey erfolgreich registriert.', false);
                 await refreshCredentialList();
+
+                const shouldAutoRedirect = autoRedirectInput && autoRedirectInput.value === '1';
+                const redirectTo = redirectInput && typeof redirectInput.value === 'string' ? redirectInput.value : '';
+                if (shouldAutoRedirect && redirectTo) {
+                    setMessage(message, 'Passkey erfolgreich registriert. Weiterleitung...', false);
+                    window.setTimeout(() => {
+                        window.location.assign(redirectTo);
+                    }, 350);
+                }
             } catch (error) {
                 setMessage(message, error instanceof Error ? error.message : 'Passkey-Registrierung fehlgeschlagen.', true);
             } finally {

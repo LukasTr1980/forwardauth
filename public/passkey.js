@@ -1,4 +1,4 @@
-/* global window, document, navigator, fetch, btoa, atob, HTMLElement */
+/* global window, document, navigator, fetch, btoa, atob, HTMLElement, URL */
 
 (() => {
     function byId(id) {
@@ -146,6 +146,41 @@
         element.style.color = isError ? '#b91c1c' : '#6b7280';
     }
 
+    function clearElement(element) {
+        while (element.firstChild) {
+            element.removeChild(element.firstChild);
+        }
+    }
+
+    function appendInfoText(container, message, isError) {
+        const paragraph = document.createElement('p');
+        paragraph.className = 'meta';
+        paragraph.textContent = message;
+        if (isError) {
+            paragraph.style.color = '#b91c1c';
+        }
+        container.appendChild(paragraph);
+    }
+
+    function sanitizeRedirectTarget(target) {
+        if (typeof target !== 'string' || target.trim() === '') {
+            return '/';
+        }
+
+        try {
+            const parsed = new URL(target, window.location.origin);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return '/';
+            }
+            if (parsed.origin !== window.location.origin) {
+                return '/';
+            }
+            return parsed.toString();
+        } catch {
+            return '/';
+        }
+    }
+
     function getLoginUsername() {
         const passkeyUsername = byId('passkey-login-username');
         if (passkeyUsername && typeof passkeyUsername.value === 'string' && passkeyUsername.value.trim()) {
@@ -200,7 +235,7 @@
                     credential,
                 });
 
-                const target = typeof verifyResponse.redirectTo === 'string' ? verifyResponse.redirectTo : '/';
+                const target = sanitizeRedirectTarget(typeof verifyResponse.redirectTo === 'string' ? verifyResponse.redirectTo : '/');
                 window.location.assign(target);
             } catch (error) {
                 setMessage(message, error instanceof Error ? error.message : 'Passkey-Login fehlgeschlagen.', true);
@@ -217,21 +252,39 @@
         return 'Auf diesem Gerät gespeichert.';
     }
 
-    function credentialRowHtml(credential, index) {
+    function createMetaLine(text) {
+        const line = document.createElement('div');
+        line.className = 'meta';
+        line.textContent = text;
+        return line;
+    }
+
+    function credentialRowElement(credential, index) {
         const createdAt = new Date(credential.createdAt).toLocaleString('de-DE');
         const lastUsedAt = new Date(credential.lastUsedAt).toLocaleString('de-DE');
         const title = typeof index === 'number' ? `Passkey ${index}` : 'Passkey';
         const storageText = passkeyStorageText(credential);
+        const item = document.createElement('div');
+        item.className = 'passkey-item';
 
-        return `
-            <div class="passkey-item">
-                <div><strong>${title}</strong></div>
-                <div class="meta">Eingerichtet am: ${createdAt}</div>
-                <div class="meta">Zuletzt genutzt: ${lastUsedAt}</div>
-                <div class="meta">${storageText}</div>
-                <button type="button" class="button--small button--danger" data-credential-id="${credential.credentialId}">Passkey entfernen</button>
-            </div>
-        `;
+        const titleLine = document.createElement('div');
+        const strong = document.createElement('strong');
+        strong.textContent = title;
+        titleLine.appendChild(strong);
+        item.appendChild(titleLine);
+
+        item.appendChild(createMetaLine(`Eingerichtet am: ${createdAt}`));
+        item.appendChild(createMetaLine(`Zuletzt genutzt: ${lastUsedAt}`));
+        item.appendChild(createMetaLine(storageText));
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'button--small button--danger';
+        button.dataset.credentialId = credential.credentialId;
+        button.textContent = 'Passkey entfernen';
+        item.appendChild(button);
+
+        return item;
     }
 
     async function refreshCredentialList() {
@@ -241,13 +294,17 @@
         try {
             const data = await getJson('/passkey/credentials');
             const credentials = Array.isArray(data.credentials) ? data.credentials : [];
+            clearElement(list);
             if (credentials.length === 0) {
-                list.innerHTML = '<p class="meta">Noch kein Passkey registriert.</p>';
+                appendInfoText(list, 'Noch kein Passkey registriert.', false);
                 return;
             }
-            list.innerHTML = credentials.map((credential, index) => credentialRowHtml(credential, index + 1)).join('');
+            credentials.forEach((credential, index) => {
+                list.appendChild(credentialRowElement(credential, index + 1));
+            });
         } catch (error) {
-            list.innerHTML = `<p class="meta" style="color:#b91c1c;">${error instanceof Error ? error.message : 'Fehler beim Laden.'}</p>`;
+            clearElement(list);
+            appendInfoText(list, error instanceof Error ? error.message : 'Fehler beim Laden.', true);
         }
     }
 
@@ -264,7 +321,8 @@
             button.disabled = true;
             setMessage(message, 'Passkeys werden auf diesem Gerät/Browser nicht unterstützt.', true);
             if (list) {
-                list.innerHTML = '<p class="meta">Passkeys nicht verfügbar.</p>';
+                clearElement(list);
+                appendInfoText(list, 'Passkeys nicht verfügbar.', false);
             }
             return;
         }
@@ -293,8 +351,9 @@
                 const redirectTo = redirectInput && typeof redirectInput.value === 'string' ? redirectInput.value : '';
                 if (shouldAutoRedirect && redirectTo) {
                     setMessage(message, 'Passkey erfolgreich registriert. Weiterleitung...', false);
+                    const safeRedirect = sanitizeRedirectTarget(redirectTo);
                     window.setTimeout(() => {
-                        window.location.assign(redirectTo);
+                        window.location.assign(safeRedirect);
                     }, 350);
                 }
             } catch (error) {

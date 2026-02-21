@@ -21,6 +21,7 @@ import { watchFile, readFileSync } from 'node:fs';
 import path from 'path';
 import helmet from 'helmet';
 import he from 'he';
+import validator from 'validator';
 import { randomUUID } from 'node:crypto';
 // CSRF cookie removed; we rely on Origin/Referer checks for POST /auth
 
@@ -80,8 +81,6 @@ function normalizeEmailIdentifier(value: string): string {
     return value.trim().toLowerCase();
 }
 
-const LOGIN_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
 function parseRequiredLoginEmail(value: unknown): string {
     if (typeof value !== 'string') {
         throw new Error('Bitte geben Sie eine E-Mail-Adresse ein.');
@@ -92,7 +91,12 @@ function parseRequiredLoginEmail(value: unknown): string {
         throw new Error('Bitte geben Sie eine E-Mail-Adresse ein.');
     }
 
-    if (!LOGIN_EMAIL_PATTERN.test(normalized)) {
+    if (!validator.isEmail(normalized, {
+        allow_utf8_local_part: false,
+        require_tld: true,
+        allow_ip_domain: false,
+        domain_specific_validation: true,
+    })) {
         throw new Error('Bitte geben Sie eine gültige E-Mail-Adresse ein.');
     }
 

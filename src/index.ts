@@ -37,13 +37,13 @@ interface LoginQuery {
 }
 
 interface LoginBody {
-    username?: string;
+    email?: string;
     password?: string;
     redirect_uri?: string;
 }
 
 interface PasskeyAuthOptionsBody {
-    username?: string;
+    email?: string;
     redirect_uri?: string;
 }
 
@@ -54,7 +54,7 @@ interface PasskeyAuthVerifyBody {
 }
 
 interface PasskeyRegisterOptionsBody {
-    username?: string;
+    email?: string;
 }
 
 interface PasskeyRegisterVerifyBody {
@@ -74,6 +74,29 @@ function getEnvAsNumber(key: string, defaultValue: number): number {
 function parseCsvList(value?: string): string[] {
     if (!value) return [];
     return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizeEmailIdentifier(value: string): string {
+    return value.trim().toLowerCase();
+}
+
+const LOGIN_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function parseRequiredLoginEmail(value: unknown): string {
+    if (typeof value !== 'string') {
+        throw new Error('Bitte geben Sie eine E-Mail-Adresse ein.');
+    }
+
+    const normalized = normalizeEmailIdentifier(value);
+    if (!normalized) {
+        throw new Error('Bitte geben Sie eine E-Mail-Adresse ein.');
+    }
+
+    if (!LOGIN_EMAIL_PATTERN.test(normalized)) {
+        throw new Error('Bitte geben Sie eine gültige E-Mail-Adresse ein.');
+    }
+
+    return normalized;
 }
 
 function normalizePathPrefix(prefix: string): string {
@@ -376,7 +399,7 @@ function isRecordOfUser(data: unknown): data is Record<string, User> {
     );
 }
 
-function extractTopLevelUsernames(jsonContent: string): string[] {
+function extractTopLevelUserKeys(jsonContent: string): string[] {
     const keys: string[] = [];
     let inString = false;
     let escaped = false;
@@ -445,20 +468,26 @@ function extractTopLevelUsernames(jsonContent: string): string[] {
     return keys;
 }
 
-function findDuplicateUsernames(jsonContent: string): string[] {
-    const usernames = extractTopLevelUsernames(jsonContent);
+function findDuplicateEmails(jsonContent: string): string[] {
+    const userKeys = extractTopLevelUserKeys(jsonContent);
     const seen = new Set<string>();
     const duplicates = new Set<string>();
 
-    for (const name of usernames) {
-        if (seen.has(name)) {
-            duplicates.add(name);
+    for (const key of userKeys) {
+        const normalized = normalizeEmailIdentifier(key);
+        if (seen.has(normalized)) {
+            duplicates.add(normalized);
         } else {
-            seen.add(name);
+            seen.add(normalized);
         }
     }
 
     return Array.from(duplicates);
+}
+
+function findNonNormalizedEmails(jsonContent: string): string[] {
+    const userKeys = extractTopLevelUserKeys(jsonContent);
+    return userKeys.filter((key) => normalizeEmailIdentifier(key) !== key);
 }
 
 function normalizeHost(host: string): string {
@@ -520,15 +549,27 @@ async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
     const { fatal = true } = options;
     try {
         const rawContent = await fs.readFile(USER_FILE, 'utf-8');
-        const duplicateUsernames = findDuplicateUsernames(rawContent);
+        const duplicateEmails = findDuplicateEmails(rawContent);
+        const nonNormalizedEmails = findNonNormalizedEmails(rawContent);
         const raw: unknown = JSON.parse(rawContent);
 
         if (!isRecordOfUser(raw)) {
             throw new Error('Invalid users.json structure');
         }
 
-        if (duplicateUsernames.length > 0) {
-            const message = `Duplicate usernames detected: ${duplicateUsernames.join(', ')}`;
+        if (duplicateEmails.length > 0) {
+            const message = `Duplicate emails detected: ${duplicateEmails.join(', ')}`;
+            if (fatal) {
+                logger.error(`[users] FATAL: ${message}`);
+                process.exit(1);
+            } else {
+                logger.warn(`[users] ${message}. Reload skipped; keeping previous users.`);
+                return;
+            }
+        }
+
+        if (nonNormalizedEmails.length > 0) {
+            const message = `users.json keys must be lowercase/trimmed emails. Invalid keys: ${nonNormalizedEmails.join(', ')}`;
             if (fatal) {
                 logger.error(`[users] FATAL: ${message}`);
                 process.exit(1);
@@ -620,8 +661,8 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
         ? `
             <div class="passkey-box">
                 <p class="passkey-title">Oder schnell mit Passkey anmelden</p>
-                <p class="meta">Tippen Sie auf den Button. Ein Benutzername ist meistens nicht nötig.</p>
-                <input id="passkey-login-username" placeholder="Benutzername nur falls nötig (optional)" autocomplete="username webauthn" />
+                <p class="meta">Tippen Sie auf den Button. Eine E-Mail ist meistens nicht nötig.</p>
+                <input id="passkey-login-email" placeholder="E-Mail nur falls nötig (optional)" autocomplete="email webauthn" />
                 <input id="passkey-login-redirect-uri" type="hidden" value="${safeDestinationUri}" />
                 <input id="passkey-allowed-domain" type="hidden" value="${he.encode(DOMAIN ?? '')}" />
                 <button id="passkey-login-button" type="button">Mit Passkey anmelden</button>
@@ -635,7 +676,7 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
         ${headlineHtml}
         <form method="post" action="${AUTH_ORIGIN}/auth">
             <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-            <input name="username" placeholder="Benutzername" required autocomplete="username" />
+            <input name="email" type="email" placeholder="E-Mail" required autocomplete="email" />
             <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
             <button type="submit">Anmelden</button>
         </form>
@@ -714,7 +755,7 @@ interface SessionStore {
 
 class RedisSessionStore implements SessionStore {
     private readonly client: RedisClientType;
-    private readonly keySessionPrefix = 'sess:token:'; // sess:token:<jti> -> username
+    private readonly keySessionPrefix = 'sess:token:'; // sess:token:<jti> -> email
     private readonly keyUserZsetPrefix = 'sess:user:'; // sess:user:<user> -> ZSET of jti scored by expiry (ms epoch)
 
     constructor(client: RedisClientType) {
@@ -1032,18 +1073,18 @@ interface StoredPasskeyCredential {
 interface StoredPasskeyChallenge {
     flowId: string;
     challenge: string;
-    username?: string;
+    email?: string;
     redirectUri?: string;
     createdAt: number;
 }
 
 interface AuthenticatedSession {
-    user: string;
+    email: string;
     jti: string;
 }
 
-function passkeyUserKey(username: string): string {
-    return `${PASSKEY_USER_PREFIX}${username}`;
+function passkeyUserKey(email: string): string {
+    return `${PASSKEY_USER_PREFIX}${email}`;
 }
 
 function passkeyCredentialKey(credentialId: string): string {
@@ -1140,7 +1181,7 @@ function parseStoredPasskeyChallenge(raw: string): StoredPasskeyChallenge | null
         return {
             flowId: parsed.flowId,
             challenge: parsed.challenge,
-            username: typeof parsed.username === 'string' ? parsed.username : undefined,
+            email: typeof parsed.email === 'string' ? parsed.email : undefined,
             redirectUri: typeof parsed.redirectUri === 'string' ? parsed.redirectUri : undefined,
             createdAt: parsed.createdAt,
         };
@@ -1153,8 +1194,8 @@ function getPasskeyExpectedOrigins(): string | string[] {
     return PASSKEY_ALLOWED_ORIGINS.length === 1 ? PASSKEY_ALLOWED_ORIGINS[0] : PASSKEY_ALLOWED_ORIGINS;
 }
 
-async function getPasskeyCredentialsForUser(username: string): Promise<StoredPasskeyCredential[]> {
-    const rawMap = await redisClient.hGetAll(passkeyUserKey(username));
+async function getPasskeyCredentialsForUser(email: string): Promise<StoredPasskeyCredential[]> {
+    const rawMap = await redisClient.hGetAll(passkeyUserKey(email));
     const parsed = Object.values(rawMap)
         .map((raw) => parseStoredPasskeyCredential(raw))
         .filter((item): item is StoredPasskeyCredential => item !== null);
@@ -1162,8 +1203,8 @@ async function getPasskeyCredentialsForUser(username: string): Promise<StoredPas
     return parsed;
 }
 
-async function getPasskeyCredentialForUser(username: string, credentialId: string): Promise<StoredPasskeyCredential | null> {
-    const raw = await redisClient.hGet(passkeyUserKey(username), credentialId);
+async function getPasskeyCredentialForUser(email: string, credentialId: string): Promise<StoredPasskeyCredential | null> {
+    const raw = await redisClient.hGet(passkeyUserKey(email), credentialId);
     if (!raw) return null;
     return parseStoredPasskeyCredential(raw);
 }
@@ -1174,31 +1215,31 @@ async function getPasskeyCredentialOwner(credentialId: string): Promise<string |
     return owner;
 }
 
-async function savePasskeyCredentialForUser(username: string, credential: StoredPasskeyCredential): Promise<boolean> {
+async function savePasskeyCredentialForUser(email: string, credential: StoredPasskeyCredential): Promise<boolean> {
     const credentialKey = passkeyCredentialKey(credential.credentialId);
     const existingOwner = await redisClient.get(credentialKey);
-    if (existingOwner && existingOwner !== username) {
+    if (existingOwner && existingOwner !== email) {
         return false;
     }
 
     if (!existingOwner) {
-        const reserved = await redisClient.set(credentialKey, username, { NX: true });
+        const reserved = await redisClient.set(credentialKey, email, { NX: true });
         if (reserved !== 'OK') {
             return false;
         }
     }
 
-    await redisClient.hSet(passkeyUserKey(username), credential.credentialId, JSON.stringify(credential));
+    await redisClient.hSet(passkeyUserKey(email), credential.credentialId, JSON.stringify(credential));
     return true;
 }
 
-async function deletePasskeyCredentialForUser(username: string, credentialId: string): Promise<boolean> {
-    const removed = await redisClient.hDel(passkeyUserKey(username), credentialId);
+async function deletePasskeyCredentialForUser(email: string, credentialId: string): Promise<boolean> {
+    const removed = await redisClient.hDel(passkeyUserKey(email), credentialId);
     if (removed === 0) return false;
 
     const credentialKey = passkeyCredentialKey(credentialId);
     const owner = await redisClient.get(credentialKey);
-    if (owner === username) {
+    if (owner === email) {
         await redisClient.del(credentialKey);
     }
     return true;
@@ -1238,7 +1279,7 @@ async function authenticateSession(req: Request): Promise<AuthenticatedSession |
             return null;
         }
 
-        return { user: payload.sub, jti: payload.jti };
+        return { email: payload.sub, jti: payload.jti };
     } catch {
         return null;
     }
@@ -1247,7 +1288,7 @@ async function authenticateSession(req: Request): Promise<AuthenticatedSession |
 async function authenticateAdmin(req: Request): Promise<string | null> {
     const auth = await authenticateSession(req);
     if (!auth) return null;
-    return users[auth.user]?.isAdmin ? auth.user : null;
+    return users[auth.email]?.isAdmin ? auth.email : null;
 }
 
 const verifyHandler: RequestHandler = async (req, res) => {
@@ -1472,18 +1513,19 @@ const passkeyRegisterOptionsHandler: RequestHandler<ParamsDictionary, unknown, P
         return;
     }
 
-    if (req.body?.username && req.body.username !== auth.user) {
-        res.status(403).json({ error: 'Benutzer stimmt nicht mit aktiver Sitzung überein.' });
+    const providedEmail = getRequiredTrimmedString(req.body?.email);
+    if (providedEmail && normalizeEmailIdentifier(providedEmail) !== auth.email) {
+        res.status(403).json({ error: 'E-Mail stimmt nicht mit aktiver Sitzung überein.' });
         return;
     }
 
-    const existingCredentials = await getPasskeyCredentialsForUser(auth.user);
+    const existingCredentials = await getPasskeyCredentialsForUser(auth.email);
     const options = await generateRegistrationOptions({
         rpName: PASSKEY_RP_NAME,
         rpID: PASSKEY_RP_ID ?? '',
-        userName: auth.user,
-        userID: new TextEncoder().encode(auth.user),
-        userDisplayName: auth.user,
+        userName: auth.email,
+        userID: new TextEncoder().encode(auth.email),
+        userDisplayName: auth.email,
         attestationType: 'none',
         authenticatorSelection: {
             residentKey: 'preferred',
@@ -1499,11 +1541,11 @@ const passkeyRegisterOptionsHandler: RequestHandler<ParamsDictionary, unknown, P
     await storePasskeyChallenge('reg', {
         flowId,
         challenge: options.challenge,
-        username: auth.user,
+        email: auth.email,
         createdAt: Date.now(),
     });
 
-    logger.info(`[passkey] registration options issued for user "${auth.user}"`);
+    logger.info(`[passkey] registration options issued for user "${auth.email}"`);
     res.status(200).json({ flowId, options });
 };
 
@@ -1544,7 +1586,7 @@ const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, Pa
         return;
     }
 
-    if (challengeState.username !== auth.user) {
+    if (challengeState.email !== auth.email) {
         res.status(403).json({ error: 'Challenge passt nicht zum aktiven Benutzer.' });
         return;
     }
@@ -1576,19 +1618,19 @@ const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, Pa
             backedUp: registrationInfo.credentialBackedUp,
         };
 
-        const saved = await savePasskeyCredentialForUser(auth.user, credential);
+        const saved = await savePasskeyCredentialForUser(auth.email, credential);
         if (!saved) {
-            logger.warn(`[passkey] Credential collision on registration for user "${auth.user}" (${redactedCredentialId(credential.credentialId)})`);
+            logger.warn(`[passkey] Credential collision on registration for user "${auth.email}" (${redactedCredentialId(credential.credentialId)})`);
             res.status(409).json({ error: 'Passkey ist bereits für einen anderen Benutzer registriert.' });
             return;
         }
 
-        logger.info(`[passkey] registration success for user "${auth.user}" (${redactedCredentialId(credential.credentialId)})`);
+        logger.info(`[passkey] registration success for user "${auth.email}" (${redactedCredentialId(credential.credentialId)})`);
         res.status(200).json({ ok: true });
     } catch (error) {
         const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
         logger.warn(
-            `[passkey] registration verify failed for user "${auth.user}": ${(error as Error).message}` +
+            `[passkey] registration verify failed for user "${auth.email}": ${(error as Error).message}` +
             (clientOrigin ? ` (clientOrigin=${clientOrigin})` : '')
         );
         res.status(400).json({ error: 'Passkey-Verifizierung fehlgeschlagen.' });
@@ -1609,18 +1651,19 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
         return;
     }
 
-    const username = getRequiredTrimmedString(req.body?.username) ?? undefined;
+    const emailInput = getRequiredTrimmedString(req.body?.email);
+    const requestedEmail = emailInput ? normalizeEmailIdentifier(emailInput) : undefined;
     let allowCredentials: { id: string; transports?: AuthenticatorTransportFuture[] }[] | undefined;
 
-    if (username) {
-        if (!users[username]) {
-            res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
+    if (requestedEmail) {
+        if (!users[requestedEmail]) {
+            res.status(400).json({ error: 'Kein Passkey für diese E-Mail vorhanden.' });
             return;
         }
 
-        const storedCredentials = await getPasskeyCredentialsForUser(username);
+        const storedCredentials = await getPasskeyCredentialsForUser(requestedEmail);
         if (storedCredentials.length === 0) {
-            res.status(400).json({ error: 'Kein Passkey für diesen Benutzer vorhanden.' });
+            res.status(400).json({ error: 'Kein Passkey für diese E-Mail vorhanden.' });
             return;
         }
 
@@ -1641,12 +1684,12 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
     await storePasskeyChallenge('auth', {
         flowId,
         challenge: options.challenge,
-        username,
+        email: requestedEmail,
         redirectUri,
         createdAt: Date.now(),
     });
 
-    logger.info(`[passkey] authentication options issued (${username ? `user "${username}"` : 'discovery'})`);
+    logger.info(`[passkey] authentication options issued (${requestedEmail ? `user "${requestedEmail}"` : 'discovery'})`);
     res.status(200).json({ flowId, options });
 };
 
@@ -1681,25 +1724,25 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         return;
     }
 
-    let username = challengeState.username;
+    let email = challengeState.email;
     const credentialId = req.body.credential.id;
     const mappedOwner = await getPasskeyCredentialOwner(credentialId);
-    username ??= mappedOwner ?? undefined;
+    email ??= mappedOwner ?? undefined;
 
-    if (!username || !users[username]) {
+    if (!email || !users[email]) {
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
 
-    if (mappedOwner && mappedOwner !== username) {
+    if (mappedOwner && mappedOwner !== email) {
         logger.warn(`[passkey] auth verify owner mismatch for credential ${redactedCredentialId(credentialId)}`);
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
 
-    const storedCredential = await getPasskeyCredentialForUser(username, credentialId);
+    const storedCredential = await getPasskeyCredentialForUser(email, credentialId);
     if (!storedCredential) {
-        logger.warn(`[passkey] auth verify failed: unknown credential for "${username}"`);
+        logger.warn(`[passkey] auth verify failed: unknown credential for "${email}"`);
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
@@ -1734,19 +1777,19 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             deviceType: verification.authenticationInfo.credentialDeviceType,
             backedUp: verification.authenticationInfo.credentialBackedUp,
         };
-        const saved = await savePasskeyCredentialForUser(username, updatedCredential);
+        const saved = await savePasskeyCredentialForUser(email, updatedCredential);
         if (!saved) {
             res.status(409).json({ error: 'Credential-Zuordnung ist nicht mehr gültig.' });
             return;
         }
 
         const jti = randomUUID();
-        await sessionStore.addSession(username, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
+        await sessionStore.addSession(email, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
 
         const jwt = await new SignJWT({})
             .setProtectedHeader({ alg: 'HS256' })
             .setIssuer(JWT_ISSUER)
-            .setSubject(username)
+            .setSubject(email)
             .setJti(jti)
             .setIssuedAt()
             .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
@@ -1756,7 +1799,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             cookie.serialize(COOKIE_NAME, jwt, getSessionCookieOptions()),
         ]);
 
-        void recordLastSeen(username, {
+        void recordLastSeen(email, {
             ip: req.ip ?? 'unknown',
             host: req.hostname || 'unknown',
             uri: challengeState.redirectUri ?? '/',
@@ -1766,7 +1809,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             jti,
         });
 
-        logger.info(`[passkey] authentication success for user "${username}" (${redactedCredentialId(storedCredential.credentialId)})`);
+        logger.info(`[passkey] authentication success for user "${email}" (${redactedCredentialId(storedCredential.credentialId)})`);
         res.status(200).json({
             ok: true,
             redirectTo: validateRedirectUri(req.body?.redirect_uri ?? challengeState.redirectUri ?? '/'),
@@ -1774,7 +1817,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
     } catch (error) {
         const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
         logger.warn(
-            `[passkey] auth verify failed for "${username}": ${(error as Error).message}` +
+            `[passkey] auth verify failed for "${email}": ${(error as Error).message}` +
             (clientOrigin ? ` (clientOrigin=${clientOrigin})` : '')
         );
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
@@ -1795,7 +1838,7 @@ const passkeyCredentialsHandler: RequestHandler = async (req, res) => {
         return;
     }
 
-    const credentials = await getPasskeyCredentialsForUser(auth.user);
+    const credentials = await getPasskeyCredentialsForUser(auth.email);
     res.status(200).json({
         credentials: credentials.map((credential) => ({
             credentialId: credential.credentialId,
@@ -1834,13 +1877,13 @@ const passkeyCredentialDeleteHandler: RequestHandler<ParamsDictionary, unknown, 
         return;
     }
 
-    const removed = await deletePasskeyCredentialForUser(auth.user, credentialId);
+    const removed = await deletePasskeyCredentialForUser(auth.email, credentialId);
     if (!removed) {
         res.status(404).json({ error: 'Passkey nicht gefunden.' });
         return;
     }
 
-    logger.info(`[passkey] credential deleted for "${auth.user}" (${redactedCredentialId(credentialId)})`);
+    logger.info(`[passkey] credential deleted for "${auth.email}" (${redactedCredentialId(credentialId)})`);
     res.status(200).json({ ok: true });
 };
 
@@ -1872,12 +1915,21 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             return;
         }
 
-        const user = req.body.username!;
+        let email = '';
+        try {
+            email = parseRequiredLoginEmail(req.body?.email);
+        } catch (error) {
+            logger.warn(`[auth] Rejected login with invalid email input from IP: ${sourceIp}`);
+            const message = `<div class="alert alert--error">${he.encode((error as Error).message)}</div><h1>Bitte anmelden</h1>`;
+            const loginFormBody = buildLoginFormBody(safeDestinationUri, message);
+            res.status(400).send(getPageHTML('Anmeldung', loginFormBody));
+            return;
+        }
         const pass = req.body.password!;
-        logger.info(`[auth] Login attempt for user "${user}" from IP: ${sourceIp}`);
+        logger.info(`[auth] Login attempt for user "${email}" from IP: ${sourceIp}`);
 
-        if (user && pass) {
-            const userObject = users[user];
+        if (email && pass) {
+            const userObject = users[email];
             const hash = userObject?.hash;
             const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$WXl3a2tCbjVYcHpGNEoyRw$g5bC13aXAa/U0KprDD9P7x0BvJ2T1jcsjpQj5Ym+kIM';
             const hashToVerify = hash || DUMMY_HASH;
@@ -1885,13 +1937,13 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             try {
                 const isMatch = await argon2.verify(hashToVerify, pass);
                 if (isMatch && hash) {
-                    logger.info(`[auth] SUCCESS: User "${user}" authenticated from IP: ${sourceIp}`);
+                    logger.info(`[auth] SUCCESS: User "${email}" authenticated from IP: ${sourceIp}`);
 
                     const jti = randomUUID();
                     // Register session before issuing the cookie, enforcing max active sessions
-                    const allowed = await sessionStore.addSession(user, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
+                    const allowed = await sessionStore.addSession(email, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
                     if (!allowed) {
-                        logger.warn(`[auth] BLOCKED: User "${user}" at session limit (${MAX_SESSIONS_PER_USER})`);
+                        logger.warn(`[auth] BLOCKED: User "${email}" at session limit (${MAX_SESSIONS_PER_USER})`);
                         const message = '<div class="alert alert--error">Zu viele aktive Sitzungen für dieses Konto. Bitte melden Sie sich auf einem anderen Gerät ab und versuchen Sie es erneut.</div>';
                         const loginFormBody = buildLoginFormBody(safeDestinationUri, `${message}<h1>Bitte anmelden</h1>`);
                         res.status(429).send(getPageHTML('Zu viele Sitzungen', loginFormBody));
@@ -1901,7 +1953,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     const jwt = await new SignJWT({})
                         .setProtectedHeader({ alg: 'HS256' })
                         .setIssuer(JWT_ISSUER)
-                        .setSubject(user)
+                        .setSubject(email)
                         .setJti(jti)
                         .setIssuedAt()
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
@@ -1912,7 +1964,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     ]);
 
                     const lastSeenHost = requestHost || req.hostname || 'unknown';
-                    void recordLastSeen(user, {
+                    void recordLastSeen(email, {
                         ip: sourceIp,
                         host: lastSeenHost,
                         uri: validatedDestinationUri,
@@ -1924,7 +1976,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 
                     if (PASSKEY_ENABLED) {
                         try {
-                            const existingPasskeys = await getPasskeyCredentialsForUser(user);
+                            const existingPasskeys = await getPasskeyCredentialsForUser(email);
                             if (existingPasskeys.length === 0) {
                                 const setupPasskeyUrl = new URL(`${AUTH_ORIGIN}/auth`);
                                 setupPasskeyUrl.searchParams.set('redirect_uri', validatedDestinationUri);
@@ -1933,7 +1985,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                                 return;
                             }
                         } catch (error) {
-                            logger.warn(`[passkey] Could not check existing passkeys for "${user}", continuing with normal redirect.`, error);
+                            logger.warn(`[passkey] Could not check existing passkeys for "${email}", continuing with normal redirect.`, error);
                         }
                     }
 
@@ -1994,7 +2046,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         logger.warn('[auth] JWT verification not present/failed (likely not logged in).');
 
         const loginMessage = req.method === 'POST'
-            ? '<div class="alert alert--error">Ungültiger Benutzername oder Passwort.</div><h1>Bitte anmelden</h1>'
+            ? '<div class="alert alert--error">Ungültige E-Mail oder Passwort.</div><h1>Bitte anmelden</h1>'
             : '<h1>Bitte anmelden</h1>';
 
         const loginFormBody = buildLoginFormBody(safeDestinationUri, loginMessage);

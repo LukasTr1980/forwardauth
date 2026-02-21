@@ -197,15 +197,21 @@
         }
     }
 
-    function getLoginUsername() {
-        const passkeyUsername = byId('passkey-login-username');
-        if (passkeyUsername && typeof passkeyUsername.value === 'string' && passkeyUsername.value.trim()) {
-            return passkeyUsername.value.trim();
+    function normalizeEmailInput(value) {
+        if (typeof value !== 'string') return '';
+        const normalized = value.trim().toLowerCase();
+        return normalized;
+    }
+
+    function getLoginEmail() {
+        const passkeyEmail = byId('passkey-login-email');
+        if (passkeyEmail && typeof passkeyEmail.value === 'string' && passkeyEmail.value.trim()) {
+            return normalizeEmailInput(passkeyEmail.value);
         }
 
-        const formUsername = document.querySelector('input[name="username"]');
-        if (formUsername && typeof formUsername.value === 'string' && formUsername.value.trim()) {
-            return formUsername.value.trim();
+        const formEmail = document.querySelector('input[name="email"]');
+        if (formEmail && typeof formEmail.value === 'string' && formEmail.value.trim()) {
+            return normalizeEmailInput(formEmail.value);
         }
 
         return '';
@@ -226,15 +232,15 @@
         }
 
         button.addEventListener('click', async () => {
-            const username = getLoginUsername();
+            const email = getLoginEmail();
             const redirectUri = redirectInput && typeof redirectInput.value === 'string' ? redirectInput.value : '/';
             button.disabled = true;
-            setMessage(message, username ? 'Passkey-Anfrage wird gestartet...' : 'Passkey-Discovery wird gestartet...', false);
+            setMessage(message, email ? 'Passkey-Anfrage wird gestartet...' : 'Passkey-Discovery wird gestartet...', false);
 
             try {
                 const optionsPayload = { redirect_uri: redirectUri };
-                if (username) {
-                    optionsPayload.username = username;
+                if (email) {
+                    optionsPayload.email = email;
                 }
 
                 const optionsResponse = await postJson('/passkey/auth/options', optionsPayload);

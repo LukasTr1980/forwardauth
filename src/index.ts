@@ -130,9 +130,8 @@ const ADULT_PATH_PREFIXES = parseCsvList(process.env.ADULT_PATH_PREFIXES).map(no
 const PASSKEY_ENABLED = process.env.PASSKEY_ENABLED === '1' || process.env.PASSKEY_ENABLED === 'true';
 const PASSKEY_RP_ID = process.env.PASSKEY_RP_ID ?? DOMAIN;
 const PASSKEY_RP_NAME = process.env.PASSKEY_RP_NAME ?? BRAND_NAME;
-const PASSKEY_ALLOWED_ORIGINS = parseCsvList(process.env.PASSKEY_ORIGIN).length > 0
-    ? parseCsvList(process.env.PASSKEY_ORIGIN)
-    : [AUTH_ORIGIN];
+const PASSKEY_ORIGIN_LIST = parseCsvList(process.env.PASSKEY_ORIGIN);
+const PASSKEY_ALLOWED_ORIGINS = PASSKEY_ORIGIN_LIST.length > 0 ? PASSKEY_ORIGIN_LIST : [AUTH_ORIGIN];
 const PASSKEY_CHALLENGE_TTL_S = getEnvAsNumber('PASSKEY_CHALLENGE_TTL_S', 120);
 const PASSKEY_LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_LOGIN_LIMITER_WINDOW_S', 15 * 60);
 const PASSKEY_REGISTER_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_REGISTER_LIMITER_WINDOW_S', 15 * 60);
@@ -140,6 +139,12 @@ const PASSKEY_CREDENTIALS_LIMITER_WINDOW_S = getEnvAsNumber('PASSKEY_CREDENTIALS
 const PASSKEY_LOGIN_LIMITER_MAX = getEnvAsNumber('PASSKEY_LOGIN_LIMITER_MAX', 30);
 const PASSKEY_REGISTER_LIMITER_MAX = getEnvAsNumber('PASSKEY_REGISTER_LIMITER_MAX', 20);
 const PASSKEY_CREDENTIALS_LIMITER_MAX = getEnvAsNumber('PASSKEY_CREDENTIALS_LIMITER_MAX', 240);
+
+function isAndroidApkKeyHashOrigin(origin: string): boolean {
+    // Used by Android Credential Manager / WebView bridge for passkeys.
+    // Pattern: android:apk-key-hash:<app-signing-hash>
+    return origin.startsWith('android:apk-key-hash:') && origin.length > 'android:apk-key-hash:'.length;
+}
 
 function isRpIdAllowedForOrigin(rpId: string, origin: string): boolean {
     try {
@@ -158,6 +163,9 @@ if (PASSKEY_ENABLED) {
     }
 
     for (const origin of PASSKEY_ALLOWED_ORIGINS) {
+        if (isAndroidApkKeyHashOrigin(origin)) {
+            continue;
+        }
         if (!isRpIdAllowedForOrigin(PASSKEY_RP_ID, origin)) {
             logger.error(`[config] FATAL: PASSKEY origin "${origin}" is not compatible with RP ID "${PASSKEY_RP_ID}".`);
             process.exit(1);
@@ -1062,6 +1070,18 @@ function base64UrlToBytes(value: string): ReturnType<Uint8Array['slice']> {
     return bytes.slice();
 }
 
+function getWebAuthnClientOrigin(clientDataJSON: string | undefined): string | undefined {
+    // Only used for logging; do not log `challenge` or other sensitive fields.
+    if (!clientDataJSON) return undefined;
+    try {
+        const raw = Buffer.from(base64UrlToBytes(clientDataJSON)).toString('utf-8');
+        const parsed = JSON.parse(raw) as { origin?: unknown };
+        return typeof parsed.origin === 'string' ? parsed.origin : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 function isTransport(value: string): value is AuthenticatorTransportFuture {
     return (
         value === 'ble' ||
@@ -1566,7 +1586,11 @@ const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, Pa
         logger.info(`[passkey] registration success for user "${auth.user}" (${redactedCredentialId(credential.credentialId)})`);
         res.status(200).json({ ok: true });
     } catch (error) {
-        logger.warn(`[passkey] registration verify failed for user "${auth.user}": ${(error as Error).message}`);
+        const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
+        logger.warn(
+            `[passkey] registration verify failed for user "${auth.user}": ${(error as Error).message}` +
+            (clientOrigin ? ` (clientOrigin=${clientOrigin})` : '')
+        );
         res.status(400).json({ error: 'Passkey-Verifizierung fehlgeschlagen.' });
     }
 };
@@ -1748,7 +1772,11 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             redirectTo: validateRedirectUri(req.body?.redirect_uri ?? challengeState.redirectUri ?? '/'),
         });
     } catch (error) {
-        logger.warn(`[passkey] auth verify failed for "${username}": ${(error as Error).message}`);
+        const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
+        logger.warn(
+            `[passkey] auth verify failed for "${username}": ${(error as Error).message}` +
+            (clientOrigin ? ` (clientOrigin=${clientOrigin})` : '')
+        );
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
     }
 };

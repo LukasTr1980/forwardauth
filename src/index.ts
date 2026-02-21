@@ -778,7 +778,7 @@ class RedisSessionStore implements SessionStore {
         await this.client.zRemRangeByScore(userKey, '-inf', nowMs);
 
         // 2) Count active sessions
-        let count = await this.client.zCard(userKey);
+        const count = await this.client.zCard(userKey);
 
         // 3) If limit reached, evict oldest active session (Last-Login-Wins)
         if (count >= maxSessions) {
@@ -789,7 +789,6 @@ class RedisSessionStore implements SessionStore {
                     .del(this.keySession(oldestJti))
                     .zRem(userKey, oldestJti)
                     .exec();
-                count--;
                 logger.info(`[sessions] Evicted oldest session for user "${user}" (jti=${oldestJti}) to respect maxSessions=${maxSessions}`);
             }
         }
@@ -1919,7 +1918,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             return;
         }
 
-        let email = '';
+        let email: string;
         try {
             email = parseRequiredLoginEmail(req.body?.email);
         } catch (error) {

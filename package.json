@@ -18,6 +18,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
+    "dev:inmemory": "JWT_SECRET=dev-secret NODE_ENV=development INMEMORY_FALLBACK=1 USER_FILE=./users.dev.json PASSKEY_ENABLED=1 PASSKEY_RP_ID=localhost PASSKEY_RP_NAME=ForwardAuth-Dev PASSKEY_ORIGIN=http://localhost:3000 tsx watch src/index.ts",
     "test": "echo \"no tests yet\"",
     "lint": "eslint . --cache",
     "generate-hash": "tsx src/generate-hash.ts",

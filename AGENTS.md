@@ -36,8 +36,10 @@
 - No force-push or history rewrites unless the user requests it explicitly.
 
 ## Security & Configuration
+- This GitHub repository is public. Treat all tracked files, PRs, issues, and comments as publicly visible.
 - Required env: `JWT_SECRET` (must be set); recommended: `DOMAIN`, optional: `COOKIE_NAME`, `USER_FILE`, rate‑limit windows and maxima.
-- Never commit secrets. `gitleaks` runs via pre‑commit and CI; fix or mark intentional.
+- Never commit secrets or sensitive data. This includes real passwords, API keys, tokens, private hostnames/internal IPs, customer/user PII, and production config values. `gitleaks` runs via pre‑commit and CI; fix or mark intentional.
+- Keep all examples sanitized with placeholders (e.g., `<DOMAIN>`, `<PASSWORD>`, `<TOKEN>`), especially in docs and deployment manifests.
 - Use HTTPS and set proper `X-Forwarded-*` headers when running behind a proxy.
 - `users.json` format: `{ "username": { "hash": "<argon2id hash>" } }`. Generate with `npm run generate-hash`.
 

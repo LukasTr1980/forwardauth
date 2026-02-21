@@ -1,5 +1,6 @@
 node_modules/
 .env
 users.json
+users.dev.json
 venv/
 .eslintcache

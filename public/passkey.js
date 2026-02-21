@@ -143,7 +143,10 @@
     function setMessage(element, message, isError) {
         if (!element) return;
         element.textContent = message;
-        element.style.color = isError ? '#b91c1c' : '#6b7280';
+        element.classList.remove('meta--error', 'meta--success');
+        if (message) {
+            element.classList.add(isError ? 'meta--error' : 'meta--success');
+        }
     }
 
     function getAllowedDomain() {
@@ -165,7 +168,7 @@
         paragraph.className = 'meta';
         paragraph.textContent = message;
         if (isError) {
-            paragraph.style.color = '#b91c1c';
+            paragraph.classList.add('meta--error');
         }
         container.appendChild(paragraph);
     }

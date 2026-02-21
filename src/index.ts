@@ -2,7 +2,7 @@ import express, { type Request, type RequestHandler } from 'express';
 import { type ParamsDictionary } from 'express-serve-static-core';
 import rateLimit, { type Store as RateLimitStore } from 'express-rate-limit';
 import { RedisStore, type RedisReply } from 'rate-limit-redis';
-import { createClient, type RedisClientType } from 'redis';
+import { createClient } from 'redis';
 import * as cookie from 'cookie';
 import { SignJWT, jwtVerify } from 'jose';
 import {
@@ -150,6 +150,7 @@ const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3
 const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
 // Brand name used in simple page layout: prefer cookie domain, else login host
 const BRAND_NAME = DOMAIN ?? new URL(LOGIN_REDIRECT_URL).hostname;
+const BRAND_AUTH_LABEL = process.env.BRAND_AUTH_LABEL ?? `${BRAND_NAME} Auth`;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
@@ -213,35 +214,381 @@ function getEnvSecret(key: string, fileKey: string): string | undefined {
     return process.env[key];
 }
 
-// Redis (REQUIRED) for rate limiting and sessions
+// Redis (or optional in-memory fallback for local development) for rate limiting and sessions
 const REDIS_URL = process.env.REDIS_URL;
 const REDIS_HOST = process.env.REDIS_HOST;
 const REDIS_PORT = getEnvAsNumber('REDIS_PORT', 6379);
 const REDIS_USERNAME = process.env.REDIS_USERNAME;
 const REDIS_PASSWORD = getEnvSecret('REDIS_PASSWORD', 'REDIS_PASSWORD_FILE');
 const REDIS_TLS = process.env.REDIS_TLS === '1' || process.env.REDIS_TLS === 'true';
+const NODE_ENV = process.env.NODE_ENV ?? 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+const INMEMORY_FALLBACK_REQUESTED = process.env.INMEMORY_FALLBACK === '1' || process.env.INMEMORY_FALLBACK === 'true';
 const LAST_SEEN_REDIS_KEY = 'user:lastseen';
+const USE_INMEMORY_STORE = !REDIS_URL && !REDIS_HOST && INMEMORY_FALLBACK_REQUESTED && !IS_PRODUCTION;
 
-if (!REDIS_URL && !REDIS_HOST) {
-    logger.error('[config] FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT).');
+if (IS_PRODUCTION && INMEMORY_FALLBACK_REQUESTED) {
+    logger.error('[config] FATAL: INMEMORY_FALLBACK is forbidden in production. Remove INMEMORY_FALLBACK and configure Redis.');
     process.exit(1);
 }
 
-let redisClient: RedisClientType;
-let loginStore: RateLimitStore;
-let verifyStore: RateLimitStore;
-let authPageStore: RateLimitStore;
-let adminLastSeenStore: RateLimitStore;
-let passkeyAuthStore: RateLimitStore;
-let passkeyRegisterStore: RateLimitStore;
-let passkeyCredentialsStore: RateLimitStore;
+if (!REDIS_URL && !REDIS_HOST && !USE_INMEMORY_STORE) {
+    logger.error('[config] FATAL: Redis configuration is required. Provide REDIS_URL or REDIS_HOST(+REDIS_PORT). INMEMORY_FALLBACK is allowed only outside production.');
+    process.exit(1);
+}
 
-if (REDIS_URL) {
-    redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD });
+interface RedisSetOptionsLike {
+    EX?: number;
+    NX?: boolean;
+}
+
+interface RedisZAddEntryLike {
+    score: number;
+    value: string;
+}
+
+interface RedisMultiLike {
+    del(key: string): RedisMultiLike;
+    zRem(key: string, member: string): RedisMultiLike;
+    set(key: string, value: string, options?: RedisSetOptionsLike): RedisMultiLike;
+    zAdd(key: string, entries: RedisZAddEntryLike[]): RedisMultiLike;
+    exec(): Promise<unknown[]>;
+}
+
+interface RedisClientLike {
+    connect(): Promise<void>;
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string, options?: RedisSetOptionsLike): Promise<string | null>;
+    getDel(key: string): Promise<string | null>;
+    del(key: string): Promise<number>;
+    mGet(keys: string[]): Promise<(string | null)[]>;
+    hSet(key: string, field: string, value: string): Promise<number>;
+    hGetAll(key: string): Promise<Record<string, string>>;
+    hGet(key: string, field: string): Promise<string | null>;
+    hDel(key: string, field: string): Promise<number>;
+    zAdd(key: string, entries: RedisZAddEntryLike[]): Promise<number>;
+    zRem(key: string, member: string): Promise<number>;
+    zRemRangeByScore(key: string, min: string | number, max: string | number): Promise<number>;
+    zCard(key: string): Promise<number>;
+    zRange(key: string, start: number, stop: number): Promise<string[]>;
+    sendCommand(args: string[]): Promise<unknown>;
+    multi(): RedisMultiLike;
+}
+
+class InMemoryRedisClient implements RedisClientLike {
+    private readonly strings = new Map<string, string>();
+    private readonly hashes = new Map<string, Map<string, string>>();
+    private readonly zsets = new Map<string, Map<string, number>>();
+    private readonly expiries = new Map<string, number>();
+
+    connect(): Promise<void> {
+        return Promise.resolve();
+    }
+
+    private deleteKeyInternal(key: string): number {
+        let removed = 0;
+        if (this.strings.delete(key)) removed = 1;
+        if (this.hashes.delete(key)) removed = 1;
+        if (this.zsets.delete(key)) removed = 1;
+        this.expiries.delete(key);
+        return removed;
+    }
+
+    private clearExpiredKey(key: string): void {
+        const expiry = this.expiries.get(key);
+        if (typeof expiry === 'number' && expiry <= Date.now()) {
+            this.deleteKeyInternal(key);
+        }
+    }
+
+    private keyExists(key: string): boolean {
+        this.clearExpiredKey(key);
+        return this.strings.has(key) || this.hashes.has(key) || this.zsets.has(key);
+    }
+
+    private ensureType(key: string, type: 'string' | 'hash' | 'zset'): void {
+        this.clearExpiredKey(key);
+        if (type !== 'string') {
+            this.strings.delete(key);
+        }
+        if (type !== 'hash') {
+            this.hashes.delete(key);
+        }
+        if (type !== 'zset') {
+            this.zsets.delete(key);
+        }
+        this.expiries.delete(key);
+    }
+
+    private parseBound(value: string | number, fallback: number): number {
+        if (typeof value === 'number') return value;
+        if (value === '-inf') return Number.NEGATIVE_INFINITY;
+        if (value === '+inf') return Number.POSITIVE_INFINITY;
+        const parsed = Number.parseFloat(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    private getSortedZsetEntries(key: string): { value: string; score: number }[] {
+        this.clearExpiredKey(key);
+        const set = this.zsets.get(key);
+        if (!set) return [];
+        return Array.from(set.entries())
+            .map(([value, score]) => ({ value, score }))
+            .sort((a, b) => (a.score === b.score ? a.value.localeCompare(b.value, 'en') : a.score - b.score));
+    }
+
+    private rangeSlice<T>(items: T[], start: number, stop: number): T[] {
+        const len = items.length;
+        if (len === 0) return [];
+        let from = start < 0 ? len + start : start;
+        let to = stop < 0 ? len + stop : stop;
+        from = Math.max(0, from);
+        to = Math.min(len - 1, to);
+        if (from > to) return [];
+        return items.slice(from, to + 1);
+    }
+
+    private collectAllKeys(): string[] {
+        const all = new Set<string>([
+            ...this.strings.keys(),
+            ...this.hashes.keys(),
+            ...this.zsets.keys(),
+        ]);
+        for (const key of all) {
+            this.clearExpiredKey(key);
+        }
+        return Array.from(all).filter((key) => this.keyExists(key)).sort((a, b) => a.localeCompare(b, 'en'));
+    }
+
+    private static globToRegex(pattern: string): RegExp {
+        const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+        return new RegExp(`^${escaped}$`);
+    }
+
+    get(key: string): Promise<string | null> {
+        this.clearExpiredKey(key);
+        return Promise.resolve(this.strings.get(key) ?? null);
+    }
+
+    set(key: string, value: string, options?: RedisSetOptionsLike): Promise<string | null> {
+        if (options?.NX && this.keyExists(key)) {
+            return Promise.resolve(null);
+        }
+
+        this.ensureType(key, 'string');
+        this.strings.set(key, value);
+
+        if (typeof options?.EX === 'number' && Number.isFinite(options.EX) && options.EX > 0) {
+            this.expiries.set(key, Date.now() + options.EX * 1000);
+        } else {
+            this.expiries.delete(key);
+        }
+
+        return Promise.resolve('OK');
+    }
+
+    getDel(key: string): Promise<string | null> {
+        this.clearExpiredKey(key);
+        const value = this.strings.get(key);
+        if (value === undefined) return Promise.resolve(null);
+        this.deleteKeyInternal(key);
+        return Promise.resolve(value);
+    }
+
+    del(key: string): Promise<number> {
+        this.clearExpiredKey(key);
+        return Promise.resolve(this.deleteKeyInternal(key));
+    }
+
+    mGet(keys: string[]): Promise<(string | null)[]> {
+        return Promise.all(keys.map((key) => this.get(key)));
+    }
+
+    hSet(key: string, field: string, value: string): Promise<number> {
+        this.ensureType(key, 'hash');
+        if (!this.hashes.has(key)) {
+            this.hashes.set(key, new Map());
+        }
+        const hash = this.hashes.get(key)!;
+        const isNew = !hash.has(field);
+        hash.set(field, value);
+        return Promise.resolve(isNew ? 1 : 0);
+    }
+
+    hGetAll(key: string): Promise<Record<string, string>> {
+        this.clearExpiredKey(key);
+        const hash = this.hashes.get(key);
+        if (!hash) return Promise.resolve({});
+        return Promise.resolve(Object.fromEntries(hash.entries()));
+    }
+
+    hGet(key: string, field: string): Promise<string | null> {
+        this.clearExpiredKey(key);
+        const hash = this.hashes.get(key);
+        if (!hash) return Promise.resolve(null);
+        return Promise.resolve(hash.get(field) ?? null);
+    }
+
+    hDel(key: string, field: string): Promise<number> {
+        this.clearExpiredKey(key);
+        const hash = this.hashes.get(key);
+        if (!hash) return Promise.resolve(0);
+        const existed = hash.delete(field);
+        if (hash.size === 0) {
+            this.hashes.delete(key);
+        }
+        return Promise.resolve(existed ? 1 : 0);
+    }
+
+    zAdd(key: string, entries: RedisZAddEntryLike[]): Promise<number> {
+        this.ensureType(key, 'zset');
+        if (!this.zsets.has(key)) {
+            this.zsets.set(key, new Map());
+        }
+        const set = this.zsets.get(key)!;
+        let added = 0;
+        for (const entry of entries) {
+            if (!set.has(entry.value)) {
+                added++;
+            }
+            set.set(entry.value, entry.score);
+        }
+        return Promise.resolve(added);
+    }
+
+    zRem(key: string, member: string): Promise<number> {
+        this.clearExpiredKey(key);
+        const set = this.zsets.get(key);
+        if (!set) return Promise.resolve(0);
+        const existed = set.delete(member);
+        if (set.size === 0) {
+            this.zsets.delete(key);
+        }
+        return Promise.resolve(existed ? 1 : 0);
+    }
+
+    zRemRangeByScore(key: string, min: string | number, max: string | number): Promise<number> {
+        this.clearExpiredKey(key);
+        const set = this.zsets.get(key);
+        if (!set) return Promise.resolve(0);
+
+        const minValue = this.parseBound(min, Number.NEGATIVE_INFINITY);
+        const maxValue = this.parseBound(max, Number.POSITIVE_INFINITY);
+        let removed = 0;
+
+        for (const [member, score] of set.entries()) {
+            if (score >= minValue && score <= maxValue) {
+                set.delete(member);
+                removed++;
+            }
+        }
+
+        if (set.size === 0) {
+            this.zsets.delete(key);
+        }
+
+        return Promise.resolve(removed);
+    }
+
+    zCard(key: string): Promise<number> {
+        this.clearExpiredKey(key);
+        return Promise.resolve(this.zsets.get(key)?.size ?? 0);
+    }
+
+    zRange(key: string, start: number, stop: number): Promise<string[]> {
+        const entries = this.getSortedZsetEntries(key);
+        return Promise.resolve(this.rangeSlice(entries, start, stop).map((entry) => entry.value));
+    }
+
+    sendCommand(args: string[]): Promise<unknown> {
+        if (args.length === 0) {
+            return Promise.reject(new Error('Empty command'));
+        }
+
+        const command = args[0].toUpperCase();
+        if (command === 'SCAN') {
+            let pattern = '*';
+            for (let i = 1; i < args.length; i++) {
+                const part = args[i]?.toUpperCase();
+                if (part === 'MATCH') {
+                    pattern = args[i + 1] ?? '*';
+                    i++;
+                } else if (part === 'COUNT') {
+                    i++;
+                }
+            }
+            const matcher = InMemoryRedisClient.globToRegex(pattern);
+            const keys = this.collectAllKeys().filter((key) => matcher.test(key));
+            return Promise.resolve(['0', keys]);
+        }
+
+        if (command === 'ZRANGE') {
+            const key = args[1] ?? '';
+            const start = Number.parseInt(args[2] ?? '0', 10);
+            const stop = Number.parseInt(args[3] ?? '-1', 10);
+            const withScores = args.slice(4).some((part) => part.toUpperCase() === 'WITHSCORES');
+            const entries = this.rangeSlice(this.getSortedZsetEntries(key), start, stop);
+            if (!withScores) {
+                return Promise.resolve(entries.map((entry) => entry.value));
+            }
+            const response: string[] = [];
+            for (const entry of entries) {
+                response.push(entry.value, String(entry.score));
+            }
+            return Promise.resolve(response);
+        }
+
+        return Promise.reject(new Error(`Unsupported in-memory Redis command: ${command}`));
+    }
+
+    multi(): RedisMultiLike {
+        const operations: (() => Promise<unknown>)[] = [];
+        const chain: RedisMultiLike = {
+            del: (key: string): RedisMultiLike => {
+                operations.push(() => this.del(key));
+                return chain;
+            },
+            zRem: (key: string, member: string): RedisMultiLike => {
+                operations.push(() => this.zRem(key, member));
+                return chain;
+            },
+            set: (key: string, value: string, options?: RedisSetOptionsLike): RedisMultiLike => {
+                operations.push(() => this.set(key, value, options));
+                return chain;
+            },
+            zAdd: (key: string, entries: RedisZAddEntryLike[]): RedisMultiLike => {
+                operations.push(() => this.zAdd(key, entries));
+                return chain;
+            },
+            exec: async (): Promise<unknown[]> => {
+                const results: unknown[] = [];
+                for (const op of operations) {
+                    results.push(await op());
+                }
+                return results;
+            },
+        };
+        return chain;
+    }
+}
+
+let redisClient: RedisClientLike;
+let loginStore: RateLimitStore | undefined;
+let verifyStore: RateLimitStore | undefined;
+let authPageStore: RateLimitStore | undefined;
+let adminLastSeenStore: RateLimitStore | undefined;
+let passkeyAuthStore: RateLimitStore | undefined;
+let passkeyRegisterStore: RateLimitStore | undefined;
+let passkeyCredentialsStore: RateLimitStore | undefined;
+
+if (USE_INMEMORY_STORE) {
+    redisClient = new InMemoryRedisClient();
+} else if (REDIS_URL) {
+    redisClient = createClient({ url: REDIS_URL, username: REDIS_USERNAME, password: REDIS_PASSWORD }) as unknown as RedisClientLike;
 } else {
     const proto = REDIS_TLS ? 'rediss' : 'redis';
     const url = `${proto}://${REDIS_HOST}:${REDIS_PORT}`;
-    redisClient = createClient({ url, username: REDIS_USERNAME, password: REDIS_PASSWORD });
+    redisClient = createClient({ url, username: REDIS_USERNAME, password: REDIS_PASSWORD }) as unknown as RedisClientLike;
 }
 
 function sanitizeRedisUrl(urlStr?: string): string | undefined {
@@ -296,13 +643,20 @@ function logStartupConfig(): void {
         adult: {
             pathPrefixes: ADULT_PATH_PREFIXES,
         },
-        redis: REDIS_URL
-            ? { mode: 'url', url: sanitizeRedisUrl(REDIS_URL), tls: REDIS_TLS }
-            : { mode: 'host', host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
+        redis: USE_INMEMORY_STORE
+            ? { mode: 'inmemory' }
+            : REDIS_URL
+                ? { mode: 'url', url: sanitizeRedisUrl(REDIS_URL), tls: REDIS_TLS }
+                : { mode: 'host', host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
         secrets: {
             jwtSecret: secretEnv ? 'set' : 'unset',
             redisPassword: REDIS_PASSWORD ? 'set' : 'unset',
             redisUsername: REDIS_USERNAME ? 'set' : 'unset',
+        },
+        runtime: {
+            nodeEnv: NODE_ENV,
+            inMemoryFallbackRequested: INMEMORY_FALLBACK_REQUESTED,
+            inMemoryFallbackActive: USE_INMEMORY_STORE,
         },
     } as const;
 
@@ -631,22 +985,35 @@ function getOriginalUrl(req: Request): string {
     return `${proto}://${host}${uri}`;
 }
 
-const getPageHTML = (title: string, body: string, options: { containerClass?: string } = {}): string => {
-    const containerClass = options.containerClass ? `container ${options.containerClass}` : 'container';
+const getPageHTML = (title: string, body: string, options: { wide?: boolean } = {}): string => {
+    const pageCardClass = options.wide ? 'page-card page-card--wide' : 'page-card';
     return `
     <!doctype html>
-    <html lang="en">
+    <html lang="de">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${title}</title>
+        <meta name="color-scheme" content="light dark">
+        <title>${he.encode(title)}</title>
         <link rel="stylesheet" href="/styles.css">
     </head>
     <body>
-        <div class="${containerClass}">
-            <div class="brand">${he.encode(BRAND_NAME)}</div>
-            ${body}
-        </div>
+        <main class="page-shell">
+            <section class="${pageCardClass}">
+                <header class="page-header">
+                    <a href="/auth" class="brand">
+                        <img class="brand__logo" src="/logo.png" alt="${he.encode(BRAND_AUTH_LABEL)} Logo" width="52" height="52" />
+                        <span class="brand__text">
+                            <span class="brand__eyebrow">${he.encode(BRAND_AUTH_LABEL)}</span>
+                            <span class="brand__name">${he.encode(BRAND_NAME)}</span>
+                        </span>
+                    </a>
+                </header>
+                <div class="page-content">
+                    ${body}
+                </div>
+            </section>
+        </main>
     </body>
     </html>
     `;
@@ -663,28 +1030,38 @@ function getSessionCookieOptions(): cookie.SerializeOptions {
 function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): string {
     const passkeySection = PASSKEY_ENABLED
         ? `
-            <div class="passkey-box">
-                <p class="passkey-title">Oder schnell mit Passkey anmelden</p>
-                <p class="meta">Tippen Sie auf den Button. Eine E-Mail ist meistens nicht nötig.</p>
-                <input id="passkey-login-email" placeholder="E-Mail nur falls nötig (optional)" autocomplete="email webauthn" />
+            <section class="passkey-box panel panel--soft" aria-labelledby="passkey-login-heading">
+                <h2 id="passkey-login-heading" class="passkey-title">Mit Passkey anmelden</h2>
+                <div class="field">
+                    <label for="passkey-login-email">E-Mail-Adresse <span class="optional-note">(OPTIONAL)</span></label>
+                    <input id="passkey-login-email" placeholder="name@example.com" autocomplete="email webauthn" />
+                </div>
                 <input id="passkey-login-redirect-uri" type="hidden" value="${safeDestinationUri}" />
                 <input id="passkey-allowed-domain" type="hidden" value="${he.encode(DOMAIN ?? '')}" />
                 <button id="passkey-login-button" type="button">Mit Passkey anmelden</button>
-                <p id="passkey-login-message" class="meta"></p>
-            </div>
+                <p id="passkey-login-message" class="meta" role="status" aria-live="polite"></p>
+            </section>
             <script src="/passkey.js" defer></script>
         `
         : '';
 
     return `
-        ${headlineHtml}
-        <form method="post" action="${AUTH_ORIGIN}/auth">
-            <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
-            <input name="email" type="email" placeholder="E-Mail" required autocomplete="email" />
-            <input name="password" type="password" placeholder="Passwort" required autocomplete="current-password" />
-            <button type="submit">Anmelden</button>
-        </form>
-        ${passkeySection}
+        <section class="content-stack">
+            ${headlineHtml}
+            <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth">
+                <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
+                <div class="field">
+                    <label for="login-email">E-Mail-Adresse</label>
+                    <input id="login-email" name="email" type="email" placeholder="name@example.com" required autocomplete="email" />
+                </div>
+                <div class="field">
+                    <label for="login-password">Passwort</label>
+                    <input id="login-password" name="password" type="password" placeholder="Passwort eingeben" required autocomplete="current-password" />
+                </div>
+                <button type="submit">Anmelden</button>
+            </form>
+            ${passkeySection}
+        </section>
     `;
 }
 
@@ -697,7 +1074,7 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
     const setupPrompt = options.setupPasskeyPrompt === true;
     const autoRedirectAfterSetup = options.autoRedirectAfterPasskeySetup === true;
     const setupPromptHtml = setupPrompt ? `
-        <div class="setup-callout">
+        <div class="setup-callout panel">
             <h2>Bitte jetzt Passkey einrichten</h2>
             <p>Damit melden Sie sich beim nächsten Mal schnell und ohne Passwort an.</p>
             <p><strong>Nach der Einrichtung geht es automatisch weiter.</strong></p>
@@ -708,38 +1085,60 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
         : 'Hier können Sie Ihre Passkey-Anmeldung einrichten oder verwalten.';
     const passkeySection = PASSKEY_ENABLED
         ? `
-            <div class="passkey-box">
-                <p class="passkey-title">${passkeyIntro}</p>
+            <section class="passkey-box panel panel--soft" aria-labelledby="passkey-register-heading">
+                <h2 id="passkey-register-heading" class="passkey-title">Passkey-Verwaltung</h2>
+                <p class="meta">${passkeyIntro}</p>
                 <button id="passkey-register-button" type="button">Passkey einrichten</button>
                 <input id="passkey-post-register-redirect-uri" type="hidden" value="${safeDestinationUri}" />
                 <input id="passkey-auto-redirect-after-register" type="hidden" value="${autoRedirectAfterSetup ? '1' : '0'}" />
                 <input id="passkey-allowed-domain" type="hidden" value="${he.encode(DOMAIN ?? '')}" />
-                <p id="passkey-register-message" class="meta"></p>
+                <p id="passkey-register-message" class="meta" role="status" aria-live="polite"></p>
                 <div id="passkey-credential-list" class="passkey-list"></div>
-            </div>
+            </section>
             <script src="/passkey.js" defer></script>
         `
         : '';
 
     if (setupPrompt) {
         return `
-            <h1>Fast geschafft</h1>
-            ${setupPromptHtml}
-            ${passkeySection}
-            <p class="meta login-actions">
-                Falls es gerade nicht möglich ist:
-                <a class="inline-link" href="${safeDestinationUri}">Passkey später einrichten</a>
-            </p>
-            <p class="meta login-actions login-actions--bottom"><a href="/logout">Abmelden</a></p>
+            <section class="content-stack">
+                <h1>Fast geschafft</h1>
+                ${setupPromptHtml}
+                ${passkeySection}
+                <p class="meta login-actions">
+                    Falls es gerade nicht möglich ist:
+                    <a class="inline-link" href="${safeDestinationUri}">Passkey später einrichten</a>
+                </p>
+                <div class="login-actions login-actions--bottom">
+                    <a class="button button--ghost" href="/logout">Abmelden</a>
+                </div>
+            </section>
         `;
     }
 
     return `
-        <h1>Angemeldet</h1>
-        <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
-        <p class="login-actions"><a href="${safeDestinationUri}">Zur geschützten Seite</a></p>
-        ${passkeySection}
-        <p class="meta login-actions login-actions--bottom"><a href="/logout">Abmelden</a></p>
+        <section class="content-stack">
+            <h1>Angemeldet</h1>
+            <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
+            <div class="action-row">
+                <a class="button button--primary" href="${safeDestinationUri}">Zur geschützten Seite</a>
+            </div>
+            ${passkeySection}
+            <div class="login-actions login-actions--bottom">
+                <a class="button button--ghost" href="/logout">Abmelden</a>
+            </div>
+        </section>
+    `;
+}
+
+function buildAdminNav(activePage: 'sessions' | 'last-seen'): string {
+    const sessionsClass = activePage === 'sessions' ? 'subnav-link is-active' : 'subnav-link';
+    const lastSeenClass = activePage === 'last-seen' ? 'subnav-link is-active' : 'subnav-link';
+    return `
+        <nav class="subnav" aria-label="Admin-Navigation">
+            <a href="/admin/sessions" class="${sessionsClass}">Aktive Sitzungen</a>
+            <a href="/admin/last-seen" class="${lastSeenClass}">Letzte Aktivität</a>
+        </nav>
     `;
 }
 
@@ -758,11 +1157,11 @@ interface SessionStore {
 }
 
 class RedisSessionStore implements SessionStore {
-    private readonly client: RedisClientType;
+    private readonly client: RedisClientLike;
     private readonly keySessionPrefix = 'sess:token:'; // sess:token:<jti> -> email
     private readonly keyUserZsetPrefix = 'sess:user:'; // sess:user:<user> -> ZSET of jti scored by expiry (ms epoch)
 
-    constructor(client: RedisClientType) {
+    constructor(client: RedisClientLike) {
         this.client = client;
     }
 
@@ -821,7 +1220,7 @@ class RedisSessionStore implements SessionStore {
     }
 }
 
-// In-memory session store removed; Redis is mandatory.
+// Session persistence is provided via Redis or an optional in-memory fallback.
 
 let sessionStore: SessionStore;
 
@@ -2085,9 +2484,13 @@ const logoutHandler: RequestHandler = async (req, res) => {
     ]);
 
     const logoutBody = `
-        <h1>Abgemeldet</h1>
-        <p>Sie wurden erfolgreich abgemeldet.</p>
-        <a href="/">Erneut anmelden</a>
+        <section class="content-stack">
+            <h1>Abgemeldet</h1>
+            <p>Sie wurden erfolgreich abgemeldet.</p>
+            <div class="action-row">
+                <a class="button button--primary" href="/">Erneut anmelden</a>
+            </div>
+        </section>
     `;
     res.status(200).send(getPageHTML('Abgemeldet', logoutBody));
 };
@@ -2131,31 +2534,34 @@ const adminLastSeenHandler: RequestHandler = async (req, res) => {
     `;
 
     const body = `
-        <h1>Letzte Aktivität</h1>
-        <p class="meta">Anzeige des letzten Logins/Verifies pro Nutzer (aus Redis gespeichert).</p>
-        <div class="table-wrapper">
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>Nutzer</th>
-                        <th>Wann</th>
-                        <th>IP</th>
-                        <th>Host</th>
-                        <th>URI</th>
-                        <th>Gerät</th>
-                        <th>Quelle</th>
-                        <th>JTI</th>
-                        <th>User Agent</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${tableRows}
-                </tbody>
-            </table>
-        </div>
+        <section class="content-stack">
+            ${buildAdminNav('last-seen')}
+            <h1>Letzte Aktivität</h1>
+            <p class="meta">Anzeige des letzten Logins/Verifies pro Nutzer (aus Redis gespeichert).</p>
+            <div class="table-wrapper">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Nutzer</th>
+                            <th>Wann</th>
+                            <th>IP</th>
+                            <th>Host</th>
+                            <th>URI</th>
+                            <th>Gerät</th>
+                            <th>Quelle</th>
+                            <th>JTI</th>
+                            <th>User Agent</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${tableRows}
+                    </tbody>
+                </table>
+            </div>
+        </section>
     `;
 
-    res.status(200).send(getPageHTML('Letzte Aktivität', body, { containerClass: 'container--wide' }));
+    res.status(200).send(getPageHTML('Letzte Aktivität', body, { wide: true }));
 };
 
 interface AdminRevokeBody {
@@ -2233,35 +2639,38 @@ const adminSessionsHandler: RequestHandler = async (req, res) => {
     `;
 
     const body = `
-        <h1>Aktive Sitzungen</h1>
-        <p class="meta">Direkt aus Redis geladen. Nur Admin-Zugriff. Sessions gelten als gültig, wenn ein passender sess:token-Eintrag existiert.</p>
-        ${noticeText ? `<div class="alert">${he.encode(noticeText)}</div>` : ''}
-        <div class="stat">
-            <span class="pill">Nutzer: ${he.encode(String(entries.length))}</span>
-            <span class="pill pill--muted">Gültig: ${he.encode(String(totalActive))} / ${he.encode(String(totalSessions))}</span>
-            <form class="inline-form" method="post" action="/admin/sessions/cleanup">
-                <button class="button--small button--danger" type="submit" onclick="return confirm('Ungültige Sessions aus Redis entfernen?')">Cleanup</button>
-            </form>
-        </div>
-        <div class="table-wrapper">
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>Nutzer</th>
-                        <th>Letzte Aktivität</th>
-                        <th>Gültig/Gesamt</th>
-                        <th>Sessions</th>
-                        <th>Aktion</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${tableRows}
-                </tbody>
-            </table>
-        </div>
+        <section class="content-stack">
+            ${buildAdminNav('sessions')}
+            <h1>Aktive Sitzungen</h1>
+            <p class="meta">Direkt aus Redis geladen. Nur Admin-Zugriff. Sessions gelten als gültig, wenn ein passender sess:token-Eintrag existiert.</p>
+            ${noticeText ? `<div class="alert">${he.encode(noticeText)}</div>` : ''}
+            <div class="stat">
+                <span class="pill">Nutzer: ${he.encode(String(entries.length))}</span>
+                <span class="pill pill--muted">Gültig: ${he.encode(String(totalActive))} / ${he.encode(String(totalSessions))}</span>
+                <form class="inline-form" method="post" action="/admin/sessions/cleanup">
+                    <button class="button--small button--danger" type="submit" onclick="return confirm('Ungültige Sessions aus Redis entfernen?')">Cleanup</button>
+                </form>
+            </div>
+            <div class="table-wrapper">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Nutzer</th>
+                            <th>Letzte Aktivität</th>
+                            <th>Gültig/Gesamt</th>
+                            <th>Sessions</th>
+                            <th>Aktion</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${tableRows}
+                    </tbody>
+                </table>
+            </div>
+        </section>
     `;
 
-    res.status(200).send(getPageHTML('Aktive Sitzungen', body, { containerClass: 'container--wide' }));
+    res.status(200).send(getPageHTML('Aktive Sitzungen', body, { wide: true }));
 };
 
 const adminSessionsRevokeHandler: RequestHandler<ParamsDictionary, string, AdminRevokeBody> = async (req, res) => {
@@ -2347,33 +2756,37 @@ void (async () => {
     logStartupConfig();
 
     try {
-        // Connect to Redis (required)
-        try {
+        if (USE_INMEMORY_STORE) {
             await redisClient.connect();
-            logger.info('[redis] Connected to Redis');
-        } catch (error) {
-            logger.error('[redis] FATAL: Failed to connect to Redis.', error);
-            process.exit(1);
+            logger.warn('[redis] INMEMORY_FALLBACK enabled: using process-local in-memory store (development only).');
+        } else {
+            try {
+                await redisClient.connect();
+                logger.info('[redis] Connected to Redis');
+            } catch (error) {
+                logger.error('[redis] FATAL: Failed to connect to Redis.', error);
+                process.exit(1);
+            }
+
+            // Create Redis-backed stores once connected
+            const sendCommand = (...args: string[]): Promise<RedisReply> => redisClient.sendCommand(args) as Promise<RedisReply>;
+            loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
+            verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
+            authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
+            adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
+            passkeyAuthStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-auth:' });
+            passkeyRegisterStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-register:' });
+            passkeyCredentialsStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-credentials:' });
         }
 
-        // Create Redis-backed stores once connected
-        const sendCommand = (...args: string[]): Promise<RedisReply> => redisClient.sendCommand(args);
-        loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
-        verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
-        authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
-        adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
-        passkeyAuthStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-auth:' });
-        passkeyRegisterStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-register:' });
-        passkeyCredentialsStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-credentials:' });
-
-        // Initialize rate limiters with Redis store
+        // Initialize rate limiters with Redis stores when available
         loginLimiter = rateLimit({
             windowMs: LOGIN_LIMITER_WINDOW_S * 1000,
             limit: LOGIN_LIMITER_MAX,
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Zu viele Anmeldeversuche von dieser IP. Bitte versuchen Sie es in 15 Minuten erneut.',
-            store: loginStore,
+            ...(loginStore ? { store: loginStore } : {}),
         });
         verifyLimiter = rateLimit({
             windowMs: VERIFY_LIMITER_WINDOW_S * 1000,
@@ -2381,7 +2794,7 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Zu viele Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
-            store: verifyStore,
+            ...(verifyStore ? { store: verifyStore } : {}),
         });
         authPageLimiter = rateLimit({
             windowMs: AUTH_PAGE_LIMITER_WINDOW_S * 1000,
@@ -2389,7 +2802,7 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Zu viele Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
-            store: authPageStore,
+            ...(authPageStore ? { store: authPageStore } : {}),
         });
         adminLastSeenLimiter = rateLimit({
             windowMs: ADMIN_LAST_SEEN_LIMITER_WINDOW_S * 1000,
@@ -2397,7 +2810,7 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Zu viele Admin-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
-            store: adminLastSeenStore,
+            ...(adminLastSeenStore ? { store: adminLastSeenStore } : {}),
         });
         passkeyAuthLimiter = rateLimit({
             windowMs: PASSKEY_LOGIN_LIMITER_WINDOW_S * 1000,
@@ -2405,7 +2818,7 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Zu viele Passkey-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
-            store: passkeyAuthStore,
+            ...(passkeyAuthStore ? { store: passkeyAuthStore } : {}),
         });
         passkeyRegisterLimiter = rateLimit({
             windowMs: PASSKEY_REGISTER_LIMITER_WINDOW_S * 1000,
@@ -2413,7 +2826,7 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Zu viele Passkey-Registrierungsanfragen von dieser IP. Bitte versuchen Sie es später erneut.',
-            store: passkeyRegisterStore,
+            ...(passkeyRegisterStore ? { store: passkeyRegisterStore } : {}),
         });
         passkeyCredentialsLimiter = rateLimit({
             windowMs: PASSKEY_CREDENTIALS_LIMITER_WINDOW_S * 1000,
@@ -2421,12 +2834,14 @@ void (async () => {
             standardHeaders: true,
             legacyHeaders: false,
             message: 'Zu viele Passkey-Abfragen von dieser IP. Bitte versuchen Sie es später erneut.',
-            store: passkeyCredentialsStore,
+            ...(passkeyCredentialsStore ? { store: passkeyCredentialsStore } : {}),
         });
 
-        // Initialize session store (Redis only)
+        // Initialize session store (Redis or in-memory fallback)
         sessionStore = new RedisSessionStore(redisClient);
-        logger.info(`[sessions] Using Redis-backed session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: last-login-wins`);
+        logger.info(
+            `[sessions] Using ${USE_INMEMORY_STORE ? 'in-memory' : 'Redis-backed'} session store; max per user: ${MAX_SESSIONS_PER_USER}; strategy: last-login-wins`
+        );
 
         // Register routes after limiters are ready
         app.get('/', (req, res) => {

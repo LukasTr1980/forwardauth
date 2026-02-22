@@ -156,6 +156,13 @@ h1 {
     line-height: 1.2;
 }
 
+.signed-in-heading {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+}
+
 h2 {
     font-size: clamp(1.05rem, 2vw, 1.35rem);
     line-height: 1.25;
@@ -165,6 +172,36 @@ h2 {
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
+}
+
+.signed-in-user {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    width: fit-content;
+    max-width: 100%;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 78%, transparent);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--color-surface-soft) 76%, var(--color-surface) 24%);
+}
+
+.signed-in-user__label {
+    color: var(--color-text-soft);
+    font-size: 0.88rem;
+    font-weight: 600;
+}
+
+.signed-in-user__pill {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+}
+
+.signed-in-heading .signed-in-user__pill {
+    font-size: clamp(1.1rem, 2vw, 1.45rem);
+    line-height: 1.1;
+    padding: 0.22rem 0.7rem;
 }
 
 .form-stack {

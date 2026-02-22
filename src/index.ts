@@ -1059,11 +1059,29 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
 }
 
 interface LoggedInBodyOptions {
+    signedInUser?: string;
     setupPasskeyPrompt?: boolean;
     autoRedirectAfterPasskeySetup?: boolean;
 }
 
 function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOptions = {}): string {
+    const signedInUser = typeof options.signedInUser === 'string' ? options.signedInUser : '';
+    const signedInHeadingHtml = signedInUser
+        ? `
+            <h1 class="signed-in-heading">
+                <span>Angemeldet als</span>
+                <span class="pill signed-in-user__pill">${he.encode(signedInUser)}</span>
+            </h1>
+        `
+        : '<h1>Angemeldet</h1>';
+    const signedInUserHtml = signedInUser
+        ? `
+            <div class="signed-in-user" aria-label="Angemeldeter Benutzer">
+                <span class="signed-in-user__label">Angemeldet als</span>
+                <span class="pill signed-in-user__pill">${he.encode(signedInUser)}</span>
+            </div>
+        `
+        : '';
     const setupPrompt = options.setupPasskeyPrompt === true;
     const autoRedirectAfterSetup = options.autoRedirectAfterPasskeySetup === true;
     const setupPromptHtml = setupPrompt ? `
@@ -1096,6 +1114,7 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
         return `
             <section class="content-stack">
                 <h1>Fast geschafft</h1>
+                ${signedInUserHtml}
                 ${setupPromptHtml}
                 ${passkeySection}
                 <p class="meta login-actions">
@@ -1111,7 +1130,7 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
 
     return `
         <section class="content-stack">
-            <h1>Angemeldet</h1>
+            ${signedInHeadingHtml}
             <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
             <div class="action-row">
                 <a class="button button--primary" href="${safeDestinationUri}">Zur geschützten Seite</a>
@@ -2435,6 +2454,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 
         const promptPasskeySetup = PASSKEY_ENABLED && setupPasskeyRequested && !hasPasskey;
         const loggedInBody = buildLoggedInBody(safeDestinationUri, {
+            signedInUser: typeof payload.sub === 'string' ? payload.sub : undefined,
             setupPasskeyPrompt: promptPasskeySetup,
             autoRedirectAfterPasskeySetup: promptPasskeySetup,
         });

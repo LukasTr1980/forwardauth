@@ -2056,23 +2056,19 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
     const emailInput = getRequiredTrimmedString(req.body?.email);
     const requestedEmail = emailInput ? normalizeEmailIdentifier(emailInput) : undefined;
     let allowCredentials: { id: string; transports?: AuthenticatorTransportFuture[] }[] | undefined;
+    let challengeEmail: string | undefined;
 
     if (requestedEmail) {
-        if (!users[requestedEmail]) {
-            res.status(400).json({ error: 'Kein Passkey für diese E-Mail vorhanden.' });
-            return;
-        }
-
+        // Avoid account/passkey enumeration: fall back to discovery when no matching
+        // user/passkey exists instead of returning an error.
         const storedCredentials = await getPasskeyCredentialsForUser(requestedEmail);
-        if (storedCredentials.length === 0) {
-            res.status(400).json({ error: 'Kein Passkey für diese E-Mail vorhanden.' });
-            return;
+        if (users[requestedEmail] && storedCredentials.length > 0) {
+            allowCredentials = storedCredentials.map((credential) => ({
+                id: credential.credentialId,
+                transports: credential.transports,
+            }));
+            challengeEmail = requestedEmail;
         }
-
-        allowCredentials = storedCredentials.map((credential) => ({
-            id: credential.credentialId,
-            transports: credential.transports,
-        }));
     }
 
     const options = await generateAuthenticationOptions({
@@ -2086,12 +2082,12 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
     await storePasskeyChallenge('auth', {
         flowId,
         challenge: options.challenge,
-        email: requestedEmail,
+        email: challengeEmail,
         redirectUri,
         createdAt: Date.now(),
     });
 
-    logger.info(`[passkey] authentication options issued (${requestedEmail ? `user "${requestedEmail}"` : 'discovery'})`);
+    logger.info(`[passkey] authentication options issued (${challengeEmail ? `user "${challengeEmail}"` : 'discovery'})`);
     res.status(200).json({ flowId, options });
 };
 
@@ -2327,7 +2323,14 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             res.status(400).send(getPageHTML('Anmeldung', loginFormBody));
             return;
         }
-        const pass = req.body.password!;
+        if (typeof req.body?.password !== 'string') {
+            logger.warn(`[auth] Rejected login with invalid password type from IP: ${sourceIp}`);
+            const message = '<div class="alert alert--error">Ungültige Anfrage.</div><h1>Bitte anmelden</h1>';
+            const loginFormBody = buildLoginFormBody(safeDestinationUri, message);
+            res.status(400).send(getPageHTML('Anmeldung', loginFormBody));
+            return;
+        }
+        const pass = req.body.password;
         logger.info(`[auth] Login attempt for user "${email}" from IP: ${sourceIp}`);
 
         if (email && pass) {

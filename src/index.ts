@@ -115,11 +115,29 @@ const LOG_LEVEL_ENV = (process.env.LOG_LEVEL ?? 'info').toLowerCase() as LogLeve
 const LOG_LEVELS: Record<Exclude<LogLevelName, never>, number> = { debug: 10, info: 20, warn: 30, error: 40, silent: 100 };
 const CURRENT_LEVEL = LOG_LEVELS[LOG_LEVEL_ENV] ?? LOG_LEVELS.info;
 
+type ConsoleLogMethod = (...args: unknown[]) => void;
+
+function emitLog(level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR', threshold: number, method: ConsoleLogMethod, args: unknown[]): void {
+    if (CURRENT_LEVEL > threshold) return;
+    if (args.length === 0) {
+        method(`[${level}]`);
+        return;
+    }
+
+    const [first, ...rest] = args;
+    if (typeof first === 'string') {
+        method(`[${level}] ${first}`, ...rest);
+        return;
+    }
+
+    method(`[${level}]`, first, ...rest);
+}
+
 const logger = {
-    debug: (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.debug) console.debug(...args as []); },
-    info:  (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.info)  console.log(...args as []); },
-    warn:  (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.warn)  console.warn(...args as []); },
-    error: (...args: unknown[]): void => { if (CURRENT_LEVEL <= LOG_LEVELS.error) console.error(...args as []); },
+    debug: (...args: unknown[]): void => { emitLog('DEBUG', LOG_LEVELS.debug, console.debug, args); },
+    info:  (...args: unknown[]): void => { emitLog('INFO', LOG_LEVELS.info, console.log, args); },
+    warn:  (...args: unknown[]): void => { emitLog('WARN', LOG_LEVELS.warn, console.warn, args); },
+    error: (...args: unknown[]): void => { emitLog('ERROR', LOG_LEVELS.error, console.error, args); },
 } as const;
 
 const secretEnv = process.env.JWT_SECRET;
@@ -602,66 +620,41 @@ function sanitizeRedisUrl(urlStr?: string): string | undefined {
     }
 }
 
-function logStartupConfig(): void {
-    const cfg = {
-        port: PORT,
-        domain: DOMAIN ?? '(unset)',
-        cookieName: COOKIE_NAME,
-        jwtIssuer: JWT_ISSUER,
-        loginRedirectUrl: LOGIN_REDIRECT_URL,
-        cookieMaxAgeS: COOKIE_MAX_AGE_S,
-        sessionMaxPerUser: MAX_SESSIONS_PER_USER,
-        windows: {
-            loginLimiterWindowS: LOGIN_LIMITER_WINDOW_S,
-            verifyLimiterWindowS: VERIFY_LIMITER_WINDOW_S,
-            authPageLimiterWindowS: AUTH_PAGE_LIMITER_WINDOW_S,
-            adminLastSeenLimiterWindowS: ADMIN_LAST_SEEN_LIMITER_WINDOW_S,
-            passkeyLoginLimiterWindowS: PASSKEY_LOGIN_LIMITER_WINDOW_S,
-            passkeyRegisterLimiterWindowS: PASSKEY_REGISTER_LIMITER_WINDOW_S,
-            passkeyCredentialsLimiterWindowS: PASSKEY_CREDENTIALS_LIMITER_WINDOW_S,
-        },
-        limits: {
-            loginLimiterMax: LOGIN_LIMITER_MAX,
-            verifyLimiterMax: VERIFY_LIMITER_MAX,
-            authPageLimiterMax: AUTH_PAGE_LIMITER_MAX,
-            adminLastSeenLimiterMax: ADMIN_LAST_SEEN_LIMITER_MAX,
-            passkeyLoginLimiterMax: PASSKEY_LOGIN_LIMITER_MAX,
-            passkeyRegisterLimiterMax: PASSKEY_REGISTER_LIMITER_MAX,
-            passkeyCredentialsLimiterMax: PASSKEY_CREDENTIALS_LIMITER_MAX,
-        },
-        users: {
-            file: USER_FILE,
-            watchIntervalMs: USER_FILE_WATCH_INTERVAL_MS,
-        },
-        passkey: {
-            enabled: PASSKEY_ENABLED,
-            rpId: PASSKEY_RP_ID ?? '(unset)',
-            rpName: PASSKEY_RP_NAME,
-            challengeTtlS: PASSKEY_CHALLENGE_TTL_S,
-            origins: PASSKEY_ALLOWED_ORIGINS,
-        },
-        adult: {
-            pathPrefixes: ADULT_PATH_PREFIXES,
-        },
-        redis: USE_INMEMORY_STORE
-            ? { mode: 'inmemory' }
-            : REDIS_URL
-                ? { mode: 'url', url: sanitizeRedisUrl(REDIS_URL), tls: REDIS_TLS }
-                : { mode: 'host', host: REDIS_HOST, port: REDIS_PORT, tls: REDIS_TLS },
-        secrets: {
-            jwtSecret: secretEnv ? 'set' : 'unset',
-            redisPassword: REDIS_PASSWORD ? 'set' : 'unset',
-            redisUsername: REDIS_USERNAME ? 'set' : 'unset',
-        },
-        runtime: {
-            nodeEnv: NODE_ENV,
-            inMemoryFallbackRequested: INMEMORY_FALLBACK_REQUESTED,
-            inMemoryFallbackActive: USE_INMEMORY_STORE,
-        },
-    } as const;
+function summarizeList(values: readonly string[], maxItems = 3): string {
+    if (values.length === 0) return 'none';
+    if (values.length <= maxItems) return values.join(', ');
+    return `${values.slice(0, maxItems).join(', ')} (+${values.length - maxItems} more)`;
+}
 
-    // Single structured log line for easier ingestion
-    logger.info(`[config] ${JSON.stringify(cfg)}`);
+function logStartupConfig(): void {
+    const redisSummary = USE_INMEMORY_STORE
+        ? 'mode=inmemory'
+        : REDIS_URL
+            ? `mode=url url=${sanitizeRedisUrl(REDIS_URL) ?? '(invalid)'} tls=${REDIS_TLS ? 'on' : 'off'}`
+            : `mode=host host=${REDIS_HOST} port=${REDIS_PORT} tls=${REDIS_TLS ? 'on' : 'off'}`;
+
+    logger.info('[config] Startup configuration (sanitized)');
+    logger.info(
+        `[config] runtime: nodeEnv=${NODE_ENV} port=${PORT} logLevel=${LOG_LEVEL_ENV} inMemoryFallbackRequested=${INMEMORY_FALLBACK_REQUESTED} inMemoryFallbackActive=${USE_INMEMORY_STORE}`
+    );
+    logger.info(
+        `[config] auth: domain=${DOMAIN ?? '(unset)'} cookieName=${COOKIE_NAME} jwtIssuer=${JWT_ISSUER} loginRedirectUrl=${LOGIN_REDIRECT_URL} cookieMaxAgeS=${COOKIE_MAX_AGE_S} maxSessionsPerUser=${MAX_SESSIONS_PER_USER}`
+    );
+    logger.info(
+        `[config] users: file=${USER_FILE} watchIntervalMs=${USER_FILE_WATCH_INTERVAL_MS} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'})`
+    );
+    logger.info(
+        `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s`
+    );
+    logger.info(
+        `[config] passkey-rate-limits: auth=${PASSKEY_LOGIN_LIMITER_MAX}/${PASSKEY_LOGIN_LIMITER_WINDOW_S}s register=${PASSKEY_REGISTER_LIMITER_MAX}/${PASSKEY_REGISTER_LIMITER_WINDOW_S}s credentials=${PASSKEY_CREDENTIALS_LIMITER_MAX}/${PASSKEY_CREDENTIALS_LIMITER_WINDOW_S}s`
+    );
+    logger.info(
+        `[config] passkey: enabled=${PASSKEY_ENABLED} rpId=${PASSKEY_RP_ID ?? '(unset)'} rpName=${PASSKEY_RP_NAME} challengeTtlS=${PASSKEY_CHALLENGE_TTL_S} origins=${PASSKEY_ALLOWED_ORIGINS.length} (${summarizeList(PASSKEY_ALLOWED_ORIGINS)})`
+    );
+    logger.info(
+        `[config] content/redis: adultPathPrefixes=${ADULT_PATH_PREFIXES.length} (${summarizeList(ADULT_PATH_PREFIXES)}) redis=${redisSummary}`
+    );
 }
 
 function acceptsHtml(req: Request): boolean {
@@ -1188,7 +1181,7 @@ class RedisSessionStore implements SessionStore {
                     .del(this.keySession(oldestJti))
                     .zRem(userKey, oldestJti)
                     .exec();
-                logger.info(`[sessions] Evicted oldest session for user "${user}" (jti=${oldestJti}) to respect maxSessions=${maxSessions}`);
+                logger.debug(`[sessions] Evicted oldest session for user "${user}" (jti=${oldestJti}) to respect maxSessions=${maxSessions}`);
             }
         }
 
@@ -1947,7 +1940,7 @@ const passkeyRegisterOptionsHandler: RequestHandler<ParamsDictionary, unknown, P
         createdAt: Date.now(),
     });
 
-    logger.info(`[passkey] registration options issued for user "${auth.email}"`);
+    logger.debug(`[passkey] registration options issued for user "${auth.email}"`);
     res.status(200).json({ flowId, options });
 };
 
@@ -2027,7 +2020,7 @@ const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, Pa
             return;
         }
 
-        logger.info(`[passkey] registration success for user "${auth.email}" (${redactedCredentialId(credential.credentialId)})`);
+        logger.debug(`[passkey] registration success for user "${auth.email}" (${redactedCredentialId(credential.credentialId)})`);
         res.status(200).json({ ok: true });
     } catch (error) {
         const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
@@ -2087,7 +2080,7 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
         createdAt: Date.now(),
     });
 
-    logger.info(`[passkey] authentication options issued (${challengeEmail ? `user "${challengeEmail}"` : 'discovery'})`);
+    logger.debug(`[passkey] authentication options issued (${challengeEmail ? `user "${challengeEmail}"` : 'discovery'})`);
     res.status(200).json({ flowId, options });
 };
 
@@ -2207,7 +2200,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             jti,
         });
 
-        logger.info(`[passkey] authentication success for user "${email}" (${redactedCredentialId(storedCredential.credentialId)})`);
+        logger.debug(`[passkey] authentication success for user "${email}" (${redactedCredentialId(storedCredential.credentialId)})`);
         res.status(200).json({
             ok: true,
             redirectTo: validateRedirectUri(req.body?.redirect_uri ?? challengeState.redirectUri ?? '/'),
@@ -2281,7 +2274,7 @@ const passkeyCredentialDeleteHandler: RequestHandler<ParamsDictionary, unknown, 
         return;
     }
 
-    logger.info(`[passkey] credential deleted for "${auth.email}" (${redactedCredentialId(credentialId)})`);
+    logger.debug(`[passkey] credential deleted for "${auth.email}" (${redactedCredentialId(credentialId)})`);
     res.status(200).json({ ok: true });
 };
 
@@ -2331,7 +2324,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             return;
         }
         const pass = req.body.password;
-        logger.info(`[auth] Login attempt for user "${email}" from IP: ${sourceIp}`);
+        logger.debug(`[auth] Login attempt for user "${email}" from IP: ${sourceIp}`);
 
         if (email && pass) {
             const userObject = users[email];
@@ -2342,7 +2335,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             try {
                 const isMatch = await argon2.verify(hashToVerify, pass);
                 if (isMatch && hash) {
-                    logger.info(`[auth] SUCCESS: User "${email}" authenticated from IP: ${sourceIp}`);
+                    logger.debug(`[auth] SUCCESS: User "${email}" authenticated from IP: ${sourceIp}`);
 
                     const jti = randomUUID();
                     // Register session before issuing the cookie, enforcing max active sessions
@@ -2416,7 +2409,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         if (typeof payload.sub === 'string' && typeof payload.jti === 'string') {
             const stillActive = await sessionStore.isActive(payload.sub, payload.jti);
             if (!stillActive) {
-                logger.warn('[auth] Inactive session token detected on /auth; clearing cookie and showing login form.');
+                logger.debug('[auth] Inactive session token detected on /auth; clearing cookie and showing login form.');
 
                 const clearCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
                 if (!DOMAIN) delete clearCookieOptions.domain;
@@ -2448,7 +2441,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         res.status(200).send(getPageHTML('Angemeldet', loggedInBody));
         return;
     } catch {
-        logger.warn('[auth] JWT verification not present/failed (likely not logged in).');
+        logger.debug('[auth] JWT verification not present/failed (likely not logged in).');
 
         const loginMessage = req.method === 'POST'
             ? '<div class="alert alert--error">Ungültige E-Mail oder Passwort.</div><h1>Bitte anmelden</h1>'
@@ -2463,7 +2456,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 const logoutHandler: RequestHandler = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
-    logger.info(`[logout] User logged out from IP: ${req.ip}`);
+    logger.debug(`[logout] User logged out from IP: ${req.ip}`);
 
     const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
     if (!DOMAIN) delete sessionCookieOptions.domain;
@@ -2865,22 +2858,22 @@ void (async () => {
         app.get('/admin/sessions', adminLastSeenLimiter, adminSessionsHandler);
         app.post('/admin/sessions/revoke', adminLastSeenLimiter, adminSessionsRevokeHandler);
         app.post('/admin/sessions/cleanup', adminLastSeenLimiter, adminSessionsCleanupHandler);
-        logger.info(`[passkey] endpoints ${PASSKEY_ENABLED ? 'enabled' : 'disabled'} (feature flag PASSKEY_ENABLED)`);
-        logger.info('[admin] /admin/last-seen enabled (admin session required)');
-        logger.info('[admin] /admin/sessions enabled (admin session required)');
+        logger.info(
+            `[startup] features: passkey=${PASSKEY_ENABLED ? 'enabled' : 'disabled'} adminLastSeen=enabled adminSessions=enabled`
+        );
 
         // Removed /still-logged route
 
         // Poll for changes in users.json and reload on modifications
         watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
             if (curr.mtimeMs !== prev.mtimeMs) {
-                logger.info(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
+                logger.debug(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
                 void loadUsers({ fatal: false });
             }
         });
 
         process.on('SIGHUP', () => {
-            logger.info('[users] SIGHUP received. Reloading users...');
+            logger.debug('[users] SIGHUP received. Reloading users...');
             void loadUsers({ fatal: false });
         });
     } catch (error) {

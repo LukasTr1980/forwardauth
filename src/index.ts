@@ -23,6 +23,12 @@ import helmet from 'helmet';
 import he from 'he';
 import validator from 'validator';
 import { randomUUID } from 'node:crypto';
+import {
+    PostgresUserStore,
+    type HostAccessMode,
+    type UserAuthRecord,
+    type UserStore,
+} from './postgres-user-store.js';
 // CSRF cookie removed; we rely on Origin/Referer checks for POST /auth
 
 interface User {
@@ -149,6 +155,9 @@ if (!secretEnv) {
 const JWT_SECRET = new TextEncoder().encode(secretEnv);
 // Resolve users.json relative to the working directory (ESM-safe and robust across tsx/tsc/Docker)
 const USER_FILE = process.env.USER_FILE ?? path.resolve(process.cwd(), 'users.json');
+const USER_STORE_BACKEND = process.env.USER_STORE_BACKEND === 'postgres' ? 'postgres' : 'json';
+const IDENTITY_DB_POOL_MAX = getEnvAsNumber('IDENTITY_DB_POOL_MAX', 10);
+const IDENTITY_DB_SSL = process.env.IDENTITY_DB_SSL === '1' || process.env.IDENTITY_DB_SSL === 'true';
 const PORT = getEnvAsNumber('PORT', 3000);
 const COOKIE_MAX_AGE_S = getEnvAsNumber('COOKIE_MAX_AGE_S', 3600);
 const LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('LOGIN_LIMITER_WINDOW_S', 15 * 60);
@@ -230,6 +239,13 @@ function getEnvSecret(key: string, fileKey: string): string | undefined {
         }
     }
     return process.env[key];
+}
+
+const IDENTITY_DATABASE_URL = getEnvSecret('IDENTITY_DATABASE_URL', 'IDENTITY_DATABASE_URL_FILE');
+
+if (USER_STORE_BACKEND === 'postgres' && !IDENTITY_DATABASE_URL) {
+    logger.error('[config] FATAL: USER_STORE_BACKEND=postgres requires IDENTITY_DATABASE_URL or IDENTITY_DATABASE_URL_FILE.');
+    process.exit(1);
 }
 
 // Redis (or optional in-memory fallback for local development) for rate limiting and sessions
@@ -620,6 +636,18 @@ function sanitizeRedisUrl(urlStr?: string): string | undefined {
     }
 }
 
+function sanitizeDatabaseUrl(urlStr?: string): string | undefined {
+    if (!urlStr) return undefined;
+    try {
+        const u = new URL(urlStr);
+        const hostPort = u.port ? `${u.hostname}:${u.port}` : u.hostname;
+        const dbName = u.pathname.replace(/^\//, '') || '(default)';
+        return `${u.protocol}//${hostPort}/${dbName}`;
+    } catch {
+        return undefined;
+    }
+}
+
 function summarizeList(values: readonly string[], maxItems = 3): string {
     if (values.length === 0) return 'none';
     if (values.length <= maxItems) return values.join(', ');
@@ -641,7 +669,7 @@ function logStartupConfig(): void {
         `[config] auth: domain=${DOMAIN ?? '(unset)'} cookieName=${COOKIE_NAME} jwtIssuer=${JWT_ISSUER} loginRedirectUrl=${LOGIN_REDIRECT_URL} cookieMaxAgeS=${COOKIE_MAX_AGE_S} maxSessionsPerUser=${MAX_SESSIONS_PER_USER}`
     );
     logger.info(
-        `[config] users: file=${USER_FILE} watchIntervalMs=${USER_FILE_WATCH_INTERVAL_MS} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'})`
+        `[config] users: backend=${USER_STORE_BACKEND} file=${USER_FILE} watchIntervalMs=${USER_FILE_WATCH_INTERVAL_MS} identityDb=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} identityDbSsl=${IDENTITY_DB_SSL ? 'on' : 'off'} identityDbPoolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'})`
     );
     logger.info(
         `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s`
@@ -723,6 +751,48 @@ let passkeyCredentialsLimiter: RequestHandler;
 // Toast page removed
 
 let users: Record<string, User> = {};
+
+function getHostAccessModeFromJsonUser(user: User): HostAccessMode {
+    if (user.allowedHosts === undefined) return 'all';
+    if (user.allowedHosts.length === 0) return 'deny_all';
+    return 'allow_list';
+}
+
+function toUserAuthRecordFromJson(email: string, user: User): UserAuthRecord {
+    const hostAccessMode = getHostAccessModeFromJsonUser(user);
+    return {
+        id: email, // json backend compatibility: historic subject/session key is the normalized email
+        email,
+        passwordHash: user.hash,
+        isAdmin: user.isAdmin === true,
+        isAdult: user.isAdult === true,
+        hostAccessMode,
+        allowedHosts: user.allowedHosts ? [...user.allowedHosts] : [],
+    };
+}
+
+class JsonUserStore implements UserStore {
+    async loadInitial(): Promise<void> {
+        await loadUsers();
+    }
+
+    async reload(): Promise<void> {
+        await loadUsers({ fatal: false });
+    }
+
+    getUserByEmail(email: string): Promise<UserAuthRecord | null> {
+        const user = users[email];
+        if (!user) return Promise.resolve(null);
+        return Promise.resolve(toUserAuthRecordFromJson(email, user));
+    }
+
+    getUserById(id: string): Promise<UserAuthRecord | null> {
+        const normalized = normalizeEmailIdentifier(id);
+        const user = users[normalized];
+        if (!user) return Promise.resolve(null);
+        return Promise.resolve(toUserAuthRecordFromJson(normalized, user));
+    }
+}
 
 function isStringArray(value: unknown): value is string[] {
     return Array.isArray(value) && value.every((item) => typeof item === 'string');
@@ -875,6 +945,20 @@ function isHostAllowed(host: string, allowedHosts?: string[]): boolean {
     });
 }
 
+function isUserAllowedOnHost(user: UserAuthRecord, host: string): boolean {
+    if (user.hostAccessMode === 'all') return true;
+    if (user.hostAccessMode === 'deny_all') return false;
+    return isHostAllowed(host, user.allowedHosts);
+}
+
+function getJwtEmailClaim(payload: unknown): string | undefined {
+    if (typeof payload !== 'object' || payload === null) return undefined;
+    const maybeEmail = (payload as { email?: unknown }).email;
+    if (typeof maybeEmail !== 'string') return undefined;
+    const normalized = normalizeEmailIdentifier(maybeEmail);
+    return normalized || undefined;
+}
+
 function getPathFromUri(uri: string): string {
     if (!uri) return '/';
     const trimmed = uri.trim();
@@ -940,6 +1024,24 @@ async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
             logger.warn(`[users] Reloading users failed; keeping previous users. (${(error as Error).message})`);
         }
     }
+}
+
+function createUserStore(): UserStore {
+    if (USER_STORE_BACKEND === 'postgres') {
+        return new PostgresUserStore({
+            databaseUrl: IDENTITY_DATABASE_URL ?? '',
+            maxPoolSize: IDENTITY_DB_POOL_MAX,
+            ssl: IDENTITY_DB_SSL,
+        });
+    }
+    return new JsonUserStore();
+}
+
+const userStore: UserStore = createUserStore();
+
+async function initializeUserStore(): Promise<void> {
+    await userStore.loadInitial();
+    logger.info(`[users] User store initialized (${USER_STORE_BACKEND})`);
 }
 
 function validateRedirectUri(uri: string): string {
@@ -1493,7 +1595,7 @@ interface StoredPasskeyChallenge {
 }
 
 interface AuthenticatedSession {
-    email: string;
+    user: UserAuthRecord;
     jti: string;
 }
 
@@ -1684,16 +1786,17 @@ async function authenticateSession(req: Request): Promise<AuthenticatedSession |
             return null;
         }
 
-        if (!users[payload.sub]) {
+        const user = await userStore.getUserById(payload.sub);
+        if (!user) {
             return null;
         }
 
-        const active = await sessionStore.isActive(payload.sub, payload.jti);
+        const active = await sessionStore.isActive(user.id, payload.jti);
         if (!active) {
             return null;
         }
 
-        return { email: payload.sub, jti: payload.jti };
+        return { user, jti: payload.jti };
     } catch {
         return null;
     }
@@ -1702,7 +1805,7 @@ async function authenticateSession(req: Request): Promise<AuthenticatedSession |
 async function authenticateAdmin(req: Request): Promise<string | null> {
     const auth = await authenticateSession(req);
     if (!auth) return null;
-    return users[auth.email]?.isAdmin ? auth.email : null;
+    return auth.user.isAdmin ? auth.user.email : null;
 }
 
 const verifyHandler: RequestHandler = async (req, res) => {
@@ -1731,7 +1834,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
             throw new Error('Token subject missing');
         }
 
-        const userRecord = users[payload.sub];
+        const userRecord = await userStore.getUserById(payload.sub);
         if (!userRecord) {
             throw new Error('User not found');
         }
@@ -1741,8 +1844,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
             throw new Error('Host header missing');
         }
 
-        if (!isHostAllowed(requestedHost, userRecord.allowedHosts)) {
-            logger.warn(`[verify] Host access denied for user "${payload.sub}" from IP ${sourceIp} on host ${requestedHost}`);
+        if (!isUserAllowedOnHost(userRecord, requestedHost)) {
+            logger.warn(`[verify] Host access denied for user "${userRecord.id}" from IP ${sourceIp} on host ${requestedHost}`);
             if (isDocumentRequest(req)) {
                 const body = '<div class="alert alert--error">Zugriff auf diesen Host ist für Ihr Konto nicht erlaubt.</div>';
                 res.status(403).set('Cache-Control', 'no-store').send(getPageHTML('Zugriff verweigert', body));
@@ -1758,7 +1861,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         const userIsAdult = userRecord.isAdult === true || payload.isAdult === true;
 
         if (adultContentRequested && !userIsAdult) {
-            logger.warn(`[verify] Adult content blocked for user "${payload.sub}" from IP ${sourceIp} on uri ${requestedUri}`);
+            logger.warn(`[verify] Adult content blocked for user "${userRecord.id}" from IP ${sourceIp} on uri ${requestedUri}`);
             if (isDocumentRequest(req)) {
                 const body = '<div class="alert alert--error">Dieser Inhalt ist nur für volljährige Nutzerinnen und Nutzer freigeschaltet.</div>';
                 res.status(403).set('Cache-Control', 'no-store').send(getPageHTML('Zugriff verweigert', body));
@@ -1773,14 +1876,14 @@ const verifyHandler: RequestHandler = async (req, res) => {
         }
 
         // Require active session for all tokens (including bearer tokens).
-        const active = await sessionStore.isActive(payload.sub, payload.jti);
+        const active = await sessionStore.isActive(userRecord.id, payload.jti);
         if (!active) {
             throw new Error('Session not active');
         }
 
-        logger.debug(`[verify] Verification successful for IP: ${sourceIp} (user: "${payload.sub}", host: ${requestedHost})`);
+        logger.debug(`[verify] Verification successful for IP: ${sourceIp} (user: "${userRecord.id}", host: ${requestedHost})`);
 
-        void recordLastSeen(payload.sub, {
+        void recordLastSeen(userRecord.id, {
             ip: sourceIp,
             host: requestedHost,
             uri: requestedUri,
@@ -1791,7 +1894,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
         });
 
         if (typeof payload.iat === 'number' && (Date.now() - payload.iat * 1000) < JUST_LOGGED_GRACE_MS) {
-            res.set('X-Forwarded-User', payload.sub);
+            res.set('X-Forwarded-User', userRecord.id);
+            res.set('X-Forwarded-User-Email', userRecord.email);
             res.set('X-Forwarded-Is-Adult', userIsAdult ? '1' : '0');
             res.sendStatus(200);
             return;
@@ -1799,7 +1903,8 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         // Removed banner redirect logic to prevent redirect loops
 
-        res.set('X-Forwarded-User', payload.sub);
+        res.set('X-Forwarded-User', userRecord.id);
+        res.set('X-Forwarded-User-Email', userRecord.email);
         res.set('X-Forwarded-Is-Adult', userIsAdult ? '1' : '0');
         res.sendStatus(200);
         return;
@@ -1842,7 +1947,7 @@ const statusHandler: RequestHandler = async (req, res) => {
             throw new Error('Token subject missing');
         }
 
-        const userRecord = users[payload.sub];
+        const userRecord = await userStore.getUserById(payload.sub);
         if (!userRecord) {
             throw new Error('User not found');
         }
@@ -1852,7 +1957,7 @@ const statusHandler: RequestHandler = async (req, res) => {
         }
 
         // Require active session for all tokens (including bearer tokens).
-        const active = await sessionStore.isActive(payload.sub, payload.jti);
+        const active = await sessionStore.isActive(userRecord.id, payload.jti);
         if (!active) {
             throw new Error('Session not active');
         }
@@ -1861,7 +1966,7 @@ const statusHandler: RequestHandler = async (req, res) => {
 
         res.set('Cache-Control', 'no-store');
         res.set('Vary', 'Cookie');
-        res.status(200).json({ loggedIn: true, user: payload.sub, isAdult: userIsAdult });
+        res.status(200).json({ loggedIn: true, user: userRecord.id, email: userRecord.email, isAdult: userIsAdult });
         return;
     } catch (error) {
         const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid, expired, or inactive session token';
@@ -1928,18 +2033,18 @@ const passkeyRegisterOptionsHandler: RequestHandler<ParamsDictionary, unknown, P
     }
 
     const providedEmail = getRequiredTrimmedString(req.body?.email);
-    if (providedEmail && normalizeEmailIdentifier(providedEmail) !== auth.email) {
+    if (providedEmail && normalizeEmailIdentifier(providedEmail) !== auth.user.email) {
         res.status(403).json({ error: 'E-Mail stimmt nicht mit aktiver Sitzung überein.' });
         return;
     }
 
-    const existingCredentials = await getPasskeyCredentialsForUser(auth.email);
+    const existingCredentials = await getPasskeyCredentialsForUser(auth.user.email);
     const options = await generateRegistrationOptions({
         rpName: PASSKEY_RP_NAME,
         rpID: PASSKEY_RP_ID ?? '',
-        userName: auth.email,
-        userID: new TextEncoder().encode(auth.email),
-        userDisplayName: auth.email,
+        userName: auth.user.email,
+        userID: new TextEncoder().encode(auth.user.id),
+        userDisplayName: auth.user.email,
         attestationType: 'none',
         authenticatorSelection: {
             residentKey: 'preferred',
@@ -1955,11 +2060,11 @@ const passkeyRegisterOptionsHandler: RequestHandler<ParamsDictionary, unknown, P
     await storePasskeyChallenge('reg', {
         flowId,
         challenge: options.challenge,
-        email: auth.email,
+        email: auth.user.email,
         createdAt: Date.now(),
     });
 
-    logger.debug(`[passkey] registration options issued for user "${auth.email}"`);
+    logger.debug(`[passkey] registration options issued for user "${auth.user.email}"`);
     res.status(200).json({ flowId, options });
 };
 
@@ -2000,7 +2105,7 @@ const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, Pa
         return;
     }
 
-    if (challengeState.email !== auth.email) {
+    if (challengeState.email !== auth.user.email) {
         res.status(403).json({ error: 'Challenge passt nicht zum aktiven Benutzer.' });
         return;
     }
@@ -2032,19 +2137,19 @@ const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, Pa
             backedUp: registrationInfo.credentialBackedUp,
         };
 
-        const saved = await savePasskeyCredentialForUser(auth.email, credential);
+        const saved = await savePasskeyCredentialForUser(auth.user.email, credential);
         if (!saved) {
-            logger.warn(`[passkey] Credential collision on registration for user "${auth.email}" (${redactedCredentialId(credential.credentialId)})`);
+            logger.warn(`[passkey] Credential collision on registration for user "${auth.user.email}" (${redactedCredentialId(credential.credentialId)})`);
             res.status(409).json({ error: 'Passkey ist bereits für einen anderen Benutzer registriert.' });
             return;
         }
 
-        logger.debug(`[passkey] registration success for user "${auth.email}" (${redactedCredentialId(credential.credentialId)})`);
+        logger.debug(`[passkey] registration success for user "${auth.user.email}" (${redactedCredentialId(credential.credentialId)})`);
         res.status(200).json({ ok: true });
     } catch (error) {
         const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
         logger.warn(
-            `[passkey] registration verify failed for user "${auth.email}": ${(error as Error).message}` +
+            `[passkey] registration verify failed for user "${auth.user.email}": ${(error as Error).message}` +
             (clientOrigin ? ` (clientOrigin=${clientOrigin})` : '')
         );
         res.status(400).json({ error: 'Passkey-Verifizierung fehlgeschlagen.' });
@@ -2074,7 +2179,8 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
         // Avoid account/passkey enumeration: fall back to discovery when no matching
         // user/passkey exists instead of returning an error.
         const storedCredentials = await getPasskeyCredentialsForUser(requestedEmail);
-        if (users[requestedEmail] && storedCredentials.length > 0) {
+        const requestedUser = await userStore.getUserByEmail(requestedEmail);
+        if (requestedUser && storedCredentials.length > 0) {
             allowCredentials = storedCredentials.map((credential) => ({
                 id: credential.credentialId,
                 transports: credential.transports,
@@ -2139,7 +2245,13 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
     const mappedOwner = await getPasskeyCredentialOwner(credentialId);
     email ??= mappedOwner ?? undefined;
 
-    if (!email || !users[email]) {
+    if (!email) {
+        res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
+        return;
+    }
+
+    const user = await userStore.getUserByEmail(email);
+    if (!user) {
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
@@ -2194,12 +2306,12 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         }
 
         const jti = randomUUID();
-        await sessionStore.addSession(email, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
+        await sessionStore.addSession(user.id, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
 
-        const jwt = await new SignJWT({})
+        const jwt = await new SignJWT({ email: user.email })
             .setProtectedHeader({ alg: 'HS256' })
             .setIssuer(JWT_ISSUER)
-            .setSubject(email)
+            .setSubject(user.id)
             .setJti(jti)
             .setIssuedAt()
             .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
@@ -2209,7 +2321,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             cookie.serialize(COOKIE_NAME, jwt, getSessionCookieOptions()),
         ]);
 
-        void recordLastSeen(email, {
+        void recordLastSeen(user.id, {
             ip: req.ip ?? 'unknown',
             host: req.hostname || 'unknown',
             uri: challengeState.redirectUri ?? '/',
@@ -2248,7 +2360,7 @@ const passkeyCredentialsHandler: RequestHandler = async (req, res) => {
         return;
     }
 
-    const credentials = await getPasskeyCredentialsForUser(auth.email);
+    const credentials = await getPasskeyCredentialsForUser(auth.user.email);
     res.status(200).json({
         credentials: credentials.map((credential) => ({
             credentialId: credential.credentialId,
@@ -2287,13 +2399,13 @@ const passkeyCredentialDeleteHandler: RequestHandler<ParamsDictionary, unknown, 
         return;
     }
 
-    const removed = await deletePasskeyCredentialForUser(auth.email, credentialId);
+    const removed = await deletePasskeyCredentialForUser(auth.user.email, credentialId);
     if (!removed) {
         res.status(404).json({ error: 'Passkey nicht gefunden.' });
         return;
     }
 
-    logger.debug(`[passkey] credential deleted for "${auth.email}" (${redactedCredentialId(credentialId)})`);
+    logger.debug(`[passkey] credential deleted for "${auth.user.email}" (${redactedCredentialId(credentialId)})`);
     res.status(200).json({ ok: true });
 };
 
@@ -2346,19 +2458,19 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         logger.debug(`[auth] Login attempt for user "${email}" from IP: ${sourceIp}`);
 
         if (email && pass) {
-            const userObject = users[email];
-            const hash = userObject?.hash;
+            const userRecord = await userStore.getUserByEmail(email);
+            const hash = userRecord?.passwordHash;
             const DUMMY_HASH = '$argon2id$v=19$m=65536,t=3,p=4$WXl3a2tCbjVYcHpGNEoyRw$g5bC13aXAa/U0KprDD9P7x0BvJ2T1jcsjpQj5Ym+kIM';
-            const hashToVerify = hash || DUMMY_HASH;
+            const hashToVerify = hash ?? DUMMY_HASH;
 
             try {
                 const isMatch = await argon2.verify(hashToVerify, pass);
-                if (isMatch && hash) {
+                if (isMatch && userRecord) {
                     logger.debug(`[auth] SUCCESS: User "${email}" authenticated from IP: ${sourceIp}`);
 
                     const jti = randomUUID();
                     // Register session before issuing the cookie, enforcing max active sessions
-                    const allowed = await sessionStore.addSession(email, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
+                    const allowed = await sessionStore.addSession(userRecord.id, jti, COOKIE_MAX_AGE_S, MAX_SESSIONS_PER_USER);
                     if (!allowed) {
                         logger.warn(`[auth] BLOCKED: User "${email}" at session limit (${MAX_SESSIONS_PER_USER})`);
                         const message = '<div class="alert alert--error">Zu viele aktive Sitzungen für dieses Konto. Bitte melden Sie sich auf einem anderen Gerät ab und versuchen Sie es erneut.</div>';
@@ -2367,10 +2479,10 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                         return;
                     }
 
-                    const jwt = await new SignJWT({})
+                    const jwt = await new SignJWT({ email: userRecord.email })
                         .setProtectedHeader({ alg: 'HS256' })
                         .setIssuer(JWT_ISSUER)
-                        .setSubject(email)
+                        .setSubject(userRecord.id)
                         .setJti(jti)
                         .setIssuedAt()
                         .setExpirationTime(`${COOKIE_MAX_AGE_S}s`)
@@ -2380,8 +2492,8 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                         cookie.serialize(COOKIE_NAME, jwt, getSessionCookieOptions())
                     ]);
 
-                    const lastSeenHost = requestHost || req.hostname || 'unknown';
-                    void recordLastSeen(email, {
+                    const lastSeenHost = requestHost ?? req.hostname ?? 'unknown';
+                    void recordLastSeen(userRecord.id, {
                         ip: sourceIp,
                         host: lastSeenHost,
                         uri: validatedDestinationUri,
@@ -2393,7 +2505,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 
                     if (PASSKEY_ENABLED) {
                         try {
-                            const existingPasskeys = await getPasskeyCredentialsForUser(email);
+                            const existingPasskeys = await getPasskeyCredentialsForUser(userRecord.email);
                             if (existingPasskeys.length === 0) {
                                 const setupPasskeyUrl = new URL(`${AUTH_ORIGIN}/auth`);
                                 setupPasskeyUrl.searchParams.set('redirect_uri', validatedDestinationUri);
@@ -2423,10 +2535,14 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         const token = cookies[COOKIE_NAME];
         if (!token) throw new Error('Not logged in');
         const { payload } = await jwtVerify(token, JWT_SECRET, { issuer: JWT_ISSUER, algorithms: ['HS256'] });
+        if (typeof payload.sub !== 'string') throw new Error('Invalid token subject');
+
+        const currentUser = await userStore.getUserById(payload.sub);
+        if (!currentUser) throw new Error('User not found');
 
         // If token carries JTI but session is not active anymore, treat as logged out.
-        if (typeof payload.sub === 'string' && typeof payload.jti === 'string') {
-            const stillActive = await sessionStore.isActive(payload.sub, payload.jti);
+        if (typeof payload.jti === 'string') {
+            const stillActive = await sessionStore.isActive(currentUser.id, payload.jti);
             if (!stillActive) {
                 logger.debug('[auth] Inactive session token detected on /auth; clearing cookie and showing login form.');
 
@@ -2444,17 +2560,17 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         }
 
         let hasPasskey = false;
-        if (PASSKEY_ENABLED && typeof payload.sub === 'string') {
+        if (PASSKEY_ENABLED) {
             try {
-                hasPasskey = (await getPasskeyCredentialsForUser(payload.sub)).length > 0;
+                hasPasskey = (await getPasskeyCredentialsForUser(currentUser.email)).length > 0;
             } catch (error) {
-                logger.warn(`[passkey] Could not load passkey list for "${payload.sub}"`, error);
+                logger.warn(`[passkey] Could not load passkey list for "${currentUser.email}"`, error);
             }
         }
 
         const promptPasskeySetup = PASSKEY_ENABLED && setupPasskeyRequested && !hasPasskey;
         const loggedInBody = buildLoggedInBody(safeDestinationUri, {
-            signedInUser: typeof payload.sub === 'string' ? payload.sub : undefined,
+            signedInUser: getJwtEmailClaim(payload) ?? currentUser.email,
             setupPasskeyPrompt: promptPasskeySetup,
             autoRedirectAfterPasskeySetup: promptPasskeySetup,
         });
@@ -2766,7 +2882,7 @@ const adminSessionsCleanupHandler: RequestHandler = async (req, res) => {
 };
 
 void (async () => {
-    await loadUsers();
+    await initializeUserStore();
 
     // Log effective configuration once at startup (secrets masked)
     logStartupConfig();
@@ -2884,18 +3000,20 @@ void (async () => {
 
         // Removed /still-logged route
 
-        // Poll for changes in users.json and reload on modifications
-        watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
-            if (curr.mtimeMs !== prev.mtimeMs) {
-                logger.debug(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
-                void loadUsers({ fatal: false });
-            }
-        });
+        if (USER_STORE_BACKEND === 'json') {
+            // Poll for changes in users.json and reload on modifications (json backend only)
+            watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
+                if (curr.mtimeMs !== prev.mtimeMs) {
+                    logger.debug(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
+                    void userStore.reload?.();
+                }
+            });
 
-        process.on('SIGHUP', () => {
-            logger.debug('[users] SIGHUP received. Reloading users...');
-            void loadUsers({ fatal: false });
-        });
+            process.on('SIGHUP', () => {
+                logger.debug('[users] SIGHUP received. Reloading users...');
+                void userStore.reload?.();
+            });
+        }
     } catch (error) {
         logger.warn('[users] Failed to initialize watch/polling for users file.', error);
     }

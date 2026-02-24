@@ -22,6 +22,7 @@
     "test": "echo \"no tests yet\"",
     "lint": "eslint . --cache",
     "generate-hash": "tsx src/generate-hash.ts",
+    "migrate-users": "tsx src/migrate-users-json-to-identity-db.ts",
     "rel:patch": "npm version patch --no-git-tag-version",
     "rel:minor": "npm version minor --no-git-tag-version",
     "rel:major": "npm version major --no-git-tag-version"
@@ -36,6 +37,7 @@
     "he": "^1.2.0",
     "helmet": "^8.1.0",
     "jose": "^6.0.11",
+    "pg": "^8.18.0",
     "rate-limit-redis": "^4.2.3",
     "redis": "^5.9.0",
     "tsx": "^4.20.3",
@@ -46,6 +48,7 @@
     "@eslint/js": "^10.0.1",
     "@types/express": "^5.0.3",
     "@types/he": "^1.2.3",
+    "@types/pg": "^8.16.0",
     "@types/validator": "^13.15.10",
     "eslint": "^10.0.1",
     "typescript-eslint": "^8.56.0"

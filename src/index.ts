@@ -1599,8 +1599,8 @@ interface AuthenticatedSession {
     jti: string;
 }
 
-function passkeyUserKey(email: string): string {
-    return `${PASSKEY_USER_PREFIX}${email}`;
+function passkeyUserKey(userId: string): string {
+    return `${PASSKEY_USER_PREFIX}${userId}`;
 }
 
 function passkeyCredentialKey(credentialId: string): string {
@@ -1710,8 +1710,8 @@ function getPasskeyExpectedOrigins(): string | string[] {
     return PASSKEY_ALLOWED_ORIGINS.length === 1 ? PASSKEY_ALLOWED_ORIGINS[0] : PASSKEY_ALLOWED_ORIGINS;
 }
 
-async function getPasskeyCredentialsForUser(email: string): Promise<StoredPasskeyCredential[]> {
-    const rawMap = await redisClient.hGetAll(passkeyUserKey(email));
+async function getPasskeyCredentialsForUser(userId: string): Promise<StoredPasskeyCredential[]> {
+    const rawMap = await redisClient.hGetAll(passkeyUserKey(userId));
     const parsed = Object.values(rawMap)
         .map((raw) => parseStoredPasskeyCredential(raw))
         .filter((item): item is StoredPasskeyCredential => item !== null);
@@ -1719,43 +1719,43 @@ async function getPasskeyCredentialsForUser(email: string): Promise<StoredPasske
     return parsed;
 }
 
-async function getPasskeyCredentialForUser(email: string, credentialId: string): Promise<StoredPasskeyCredential | null> {
-    const raw = await redisClient.hGet(passkeyUserKey(email), credentialId);
+async function getPasskeyCredentialForUser(userId: string, credentialId: string): Promise<StoredPasskeyCredential | null> {
+    const raw = await redisClient.hGet(passkeyUserKey(userId), credentialId);
     if (!raw) return null;
     return parseStoredPasskeyCredential(raw);
 }
 
-async function getPasskeyCredentialOwner(credentialId: string): Promise<string | null> {
-    const owner = await redisClient.get(passkeyCredentialKey(credentialId));
-    if (!owner || owner.trim() === '') return null;
-    return owner;
+async function getPasskeyCredentialOwnerUserId(credentialId: string): Promise<string | null> {
+    const ownerUserId = await redisClient.get(passkeyCredentialKey(credentialId));
+    if (!ownerUserId || ownerUserId.trim() === '') return null;
+    return ownerUserId;
 }
 
-async function savePasskeyCredentialForUser(email: string, credential: StoredPasskeyCredential): Promise<boolean> {
+async function savePasskeyCredentialForUser(userId: string, credential: StoredPasskeyCredential): Promise<boolean> {
     const credentialKey = passkeyCredentialKey(credential.credentialId);
     const existingOwner = await redisClient.get(credentialKey);
-    if (existingOwner && existingOwner !== email) {
+    if (existingOwner && existingOwner !== userId) {
         return false;
     }
 
     if (!existingOwner) {
-        const reserved = await redisClient.set(credentialKey, email, { NX: true });
+        const reserved = await redisClient.set(credentialKey, userId, { NX: true });
         if (reserved !== 'OK') {
             return false;
         }
     }
 
-    await redisClient.hSet(passkeyUserKey(email), credential.credentialId, JSON.stringify(credential));
+    await redisClient.hSet(passkeyUserKey(userId), credential.credentialId, JSON.stringify(credential));
     return true;
 }
 
-async function deletePasskeyCredentialForUser(email: string, credentialId: string): Promise<boolean> {
-    const removed = await redisClient.hDel(passkeyUserKey(email), credentialId);
+async function deletePasskeyCredentialForUser(userId: string, credentialId: string): Promise<boolean> {
+    const removed = await redisClient.hDel(passkeyUserKey(userId), credentialId);
     if (removed === 0) return false;
 
     const credentialKey = passkeyCredentialKey(credentialId);
     const owner = await redisClient.get(credentialKey);
-    if (owner === email) {
+    if (owner === userId) {
         await redisClient.del(credentialKey);
     }
     return true;
@@ -2038,7 +2038,7 @@ const passkeyRegisterOptionsHandler: RequestHandler<ParamsDictionary, unknown, P
         return;
     }
 
-    const existingCredentials = await getPasskeyCredentialsForUser(auth.user.email);
+    const existingCredentials = await getPasskeyCredentialsForUser(auth.user.id);
     const options = await generateRegistrationOptions({
         rpName: PASSKEY_RP_NAME,
         rpID: PASSKEY_RP_ID ?? '',
@@ -2137,7 +2137,7 @@ const passkeyRegisterVerifyHandler: RequestHandler<ParamsDictionary, unknown, Pa
             backedUp: registrationInfo.credentialBackedUp,
         };
 
-        const saved = await savePasskeyCredentialForUser(auth.user.email, credential);
+        const saved = await savePasskeyCredentialForUser(auth.user.id, credential);
         if (!saved) {
             logger.warn(`[passkey] Credential collision on registration for user "${auth.user.email}" (${redactedCredentialId(credential.credentialId)})`);
             res.status(409).json({ error: 'Passkey ist bereits für einen anderen Benutzer registriert.' });
@@ -2178,8 +2178,8 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
     if (requestedEmail) {
         // Avoid account/passkey enumeration: fall back to discovery when no matching
         // user/passkey exists instead of returning an error.
-        const storedCredentials = await getPasskeyCredentialsForUser(requestedEmail);
         const requestedUser = await userStore.getUserByEmail(requestedEmail);
+        const storedCredentials = requestedUser ? await getPasskeyCredentialsForUser(requestedUser.id) : [];
         if (requestedUser && storedCredentials.length > 0) {
             allowCredentials = storedCredentials.map((credential) => ({
                 id: credential.credentialId,
@@ -2240,31 +2240,29 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         return;
     }
 
-    let email = challengeState.email;
+    const challengeEmail = challengeState.email;
     const credentialId = req.body.credential.id;
-    const mappedOwner = await getPasskeyCredentialOwner(credentialId);
-    email ??= mappedOwner ?? undefined;
+    const mappedOwnerUserId = await getPasskeyCredentialOwnerUserId(credentialId);
 
-    if (!email) {
-        res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
-        return;
+    let user = challengeEmail ? await userStore.getUserByEmail(challengeEmail) : null;
+    if (!user && mappedOwnerUserId) {
+        user = await userStore.getUserById(mappedOwnerUserId);
     }
 
-    const user = await userStore.getUserByEmail(email);
     if (!user) {
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
 
-    if (mappedOwner && mappedOwner !== email) {
+    if (mappedOwnerUserId && mappedOwnerUserId !== user.id) {
         logger.warn(`[passkey] auth verify owner mismatch for credential ${redactedCredentialId(credentialId)}`);
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
 
-    const storedCredential = await getPasskeyCredentialForUser(email, credentialId);
+    const storedCredential = await getPasskeyCredentialForUser(user.id, credentialId);
     if (!storedCredential) {
-        logger.warn(`[passkey] auth verify failed: unknown credential for "${email}"`);
+        logger.warn(`[passkey] auth verify failed: unknown credential for "${user.email}"`);
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
         return;
     }
@@ -2299,7 +2297,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             deviceType: verification.authenticationInfo.credentialDeviceType,
             backedUp: verification.authenticationInfo.credentialBackedUp,
         };
-        const saved = await savePasskeyCredentialForUser(email, updatedCredential);
+        const saved = await savePasskeyCredentialForUser(user.id, updatedCredential);
         if (!saved) {
             res.status(409).json({ error: 'Credential-Zuordnung ist nicht mehr gültig.' });
             return;
@@ -2331,7 +2329,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             jti,
         });
 
-        logger.debug(`[passkey] authentication success for user "${email}" (${redactedCredentialId(storedCredential.credentialId)})`);
+        logger.debug(`[passkey] authentication success for user "${user.email}" (${redactedCredentialId(storedCredential.credentialId)})`);
         res.status(200).json({
             ok: true,
             redirectTo: validateRedirectUri(req.body?.redirect_uri ?? challengeState.redirectUri ?? '/'),
@@ -2339,7 +2337,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
     } catch (error) {
         const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
         logger.warn(
-            `[passkey] auth verify failed for "${email}": ${(error as Error).message}` +
+            `[passkey] auth verify failed for "${user.email}": ${(error as Error).message}` +
             (clientOrigin ? ` (clientOrigin=${clientOrigin})` : '')
         );
         res.status(401).json({ error: 'Passkey-Anmeldung fehlgeschlagen.' });
@@ -2360,7 +2358,7 @@ const passkeyCredentialsHandler: RequestHandler = async (req, res) => {
         return;
     }
 
-    const credentials = await getPasskeyCredentialsForUser(auth.user.email);
+    const credentials = await getPasskeyCredentialsForUser(auth.user.id);
     res.status(200).json({
         credentials: credentials.map((credential) => ({
             credentialId: credential.credentialId,
@@ -2399,7 +2397,7 @@ const passkeyCredentialDeleteHandler: RequestHandler<ParamsDictionary, unknown, 
         return;
     }
 
-    const removed = await deletePasskeyCredentialForUser(auth.user.email, credentialId);
+    const removed = await deletePasskeyCredentialForUser(auth.user.id, credentialId);
     if (!removed) {
         res.status(404).json({ error: 'Passkey nicht gefunden.' });
         return;
@@ -2505,7 +2503,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
 
                     if (PASSKEY_ENABLED) {
                         try {
-                            const existingPasskeys = await getPasskeyCredentialsForUser(userRecord.email);
+                            const existingPasskeys = await getPasskeyCredentialsForUser(userRecord.id);
                             if (existingPasskeys.length === 0) {
                                 const setupPasskeyUrl = new URL(`${AUTH_ORIGIN}/auth`);
                                 setupPasskeyUrl.searchParams.set('redirect_uri', validatedDestinationUri);
@@ -2562,7 +2560,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         let hasPasskey = false;
         if (PASSKEY_ENABLED) {
             try {
-                hasPasskey = (await getPasskeyCredentialsForUser(currentUser.email)).length > 0;
+                hasPasskey = (await getPasskeyCredentialsForUser(currentUser.id)).length > 0;
             } catch (error) {
                 logger.warn(`[passkey] Could not load passkey list for "${currentUser.email}"`, error);
             }

@@ -1436,25 +1436,35 @@ function buildForgotPasswordFormBody(messageHtml = ''): string {
     const turnstileHtml = TURNSTILE_FORGOT_PASSWORD_ENABLED
         ? `
             <div class="turnstile-wrap">
-                <div class="cf-turnstile" data-sitekey="${he.encode(TURNSTILE_SITE_KEY)}" data-action="forgot_password"></div>
-                <p class="meta">Sicherheitspruefung erforderlich.</p>
+                <div
+                    class="cf-turnstile"
+                    data-sitekey="${he.encode(TURNSTILE_SITE_KEY)}"
+                    data-action="forgot_password"
+                    data-callback="onForgotPasswordTurnstileSuccess"
+                    data-expired-callback="onForgotPasswordTurnstileExpired"
+                    data-error-callback="onForgotPasswordTurnstileError"
+                ></div>
+                <p id="forgot-turnstile-status" class="meta meta--error"><strong>Bitte erst die Sicherheitsprüfung abschließen.</strong></p>
             </div>
             <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+            <script src="/turnstile.js" defer></script>
         `
         : '';
+    const submitDisabledAttribute = TURNSTILE_FORGOT_PASSWORD_ENABLED ? 'disabled' : '';
+    const turnstileRequiredFlag = TURNSTILE_FORGOT_PASSWORD_ENABLED ? '1' : '0';
 
     return `
         <section class="content-stack">
             <h1>Passwort vergessen?</h1>
             <p>Geben Sie Ihre E-Mail-Adresse ein. Wenn ein Konto existiert, senden wir Ihnen einen Link zum Zurücksetzen.</p>
             ${messageHtml}
-            <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth/forgot-password">
+            <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth/forgot-password" data-turnstile-required="${turnstileRequiredFlag}">
                 <div class="field">
                     <label for="forgot-email">E-Mail-Adresse</label>
                     <input id="forgot-email" name="email" type="email" placeholder="name@example.com" required autocomplete="email" />
                 </div>
                 ${turnstileHtml}
-                <button type="submit">Reset-Link anfordern</button>
+                <button id="forgot-submit-button" type="submit" ${submitDisabledAttribute}>Reset-Link anfordern</button>
             </form>
             <p class="meta"><a class="inline-link" href="/auth">Zurück zur Anmeldung</a></p>
         </section>
@@ -2833,7 +2843,7 @@ const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, Forg
         const turnstileResult = await verifyForgotPasswordTurnstile(req as Request);
         if (!turnstileResult.ok) {
             logger.warn(`[password-reset] Turnstile verification failed from IP ${sourceIp} (reason=${turnstileResult.reason})`);
-            const message = '<div class="alert alert--error">Sicherheitspruefung fehlgeschlagen. Bitte erneut versuchen.</div>';
+            const message = '<div class="alert alert--error">Sicherheitsprüfung fehlgeschlagen. Bitte erneut versuchen.</div>';
             res.status(400).send(getPageHTML('Passwort vergessen', buildForgotPasswordFormBody(message)));
             return;
         }

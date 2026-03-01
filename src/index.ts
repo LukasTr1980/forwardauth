@@ -224,10 +224,12 @@ const COOKIE_MAX_AGE_S = getEnvAsNumber('COOKIE_MAX_AGE_S', 3600);
 const LOGIN_LIMITER_WINDOW_S = getEnvAsNumber('LOGIN_LIMITER_WINDOW_S', 15 * 60);
 const VERIFY_LIMITER_WINDOW_S = getEnvAsNumber('VERIFY_LIMITER_WINDOW_S', 60);
 const AUTH_PAGE_LIMITER_WINDOW_S = getEnvAsNumber('AUTH_PAGE_LIMITER_WINDOW_S', 15 * 60);
+const LOGOUT_LIMITER_WINDOW_S = getEnvAsNumber('LOGOUT_LIMITER_WINDOW_S', 15 * 60);
 const ADMIN_LAST_SEEN_LIMITER_WINDOW_S = getEnvAsNumber('ADMIN_LAST_SEEN_LIMITER_WINDOW_S', 60);
 const LOGIN_LIMITER_MAX = getEnvAsNumber('LOGIN_LIMITER_MAX', 10);
 const VERIFY_LIMITER_MAX = getEnvAsNumber('VERIFY_LIMITER_MAX', 5000);
 const AUTH_PAGE_LIMITER_MAX = getEnvAsNumber('AUTH_PAGE_LIMITER_MAX', 300);
+const LOGOUT_LIMITER_MAX = getEnvAsNumber('LOGOUT_LIMITER_MAX', 120);
 const ADMIN_LAST_SEEN_LIMITER_MAX = getEnvAsNumber('ADMIN_LAST_SEEN_LIMITER_MAX', 30);
 const COOKIE_NAME = process.env.COOKIE_NAME ?? 'fwd_token';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'forwardauth';
@@ -733,6 +735,7 @@ let redisClient: RedisClientLike;
 let loginStore: RateLimitStore | undefined;
 let verifyStore: RateLimitStore | undefined;
 let authPageStore: RateLimitStore | undefined;
+let logoutStore: RateLimitStore | undefined;
 let adminLastSeenStore: RateLimitStore | undefined;
 let forgotPasswordStore: RateLimitStore | undefined;
 let resetPasswordConfirmStore: RateLimitStore | undefined;
@@ -797,7 +800,7 @@ function logStartupConfig(): void {
         `[config] users: backend=${USER_STORE_BACKEND} file=${USER_FILE} watchIntervalMs=${USER_FILE_WATCH_INTERVAL_MS} identityDb=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} identityDbSsl=${IDENTITY_DB_SSL ? 'on' : 'off'} identityDbPoolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'}, resendApiKey=${RESEND_API_KEY ? 'set' : 'unset'})`
     );
     logger.info(
-        `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s forgotPassword=${PASSWORD_RESET_LIMITER_MAX}/${PASSWORD_RESET_LIMITER_WINDOW_S}s resetPassword=${PASSWORD_RESET_CONFIRM_LIMITER_MAX}/${PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S}s`
+        `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s logout=${LOGOUT_LIMITER_MAX}/${LOGOUT_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s forgotPassword=${PASSWORD_RESET_LIMITER_MAX}/${PASSWORD_RESET_LIMITER_WINDOW_S}s resetPassword=${PASSWORD_RESET_CONFIRM_LIMITER_MAX}/${PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S}s`
     );
     logger.info(
         `[config] password-reset/email: enabled=${PASSWORD_RESET_ENABLED} tokenTtlS=${PASSWORD_RESET_TOKEN_TTL_S} mailQuota=${PASSWORD_RESET_MAIL_MAX}/${PASSWORD_RESET_MAIL_WINDOW_S}s resetUrlBase=${PASSWORD_RESET_URL_BASE_PARSED.toString()} passwordMinLength=${PASSWORD_MIN_LENGTH} passwordMaxLength=${PASSWORD_MAX_LENGTH} emailProvider=${EMAIL_PROVIDER} emailFrom=${EMAIL_FROM}`
@@ -884,6 +887,7 @@ app.set('trust proxy', 1);
 let loginLimiter: RequestHandler;
 let verifyLimiter: RequestHandler;
 let authPageLimiter: RequestHandler;
+let logoutLimiter: RequestHandler;
 let adminLastSeenLimiter: RequestHandler;
 let forgotPasswordLimiter: RequestHandler;
 let resetPasswordConfirmLimiter: RequestHandler;
@@ -3492,6 +3496,7 @@ void (async () => {
             loginStore = new RedisStore({ sendCommand, prefix: 'rl:login:' });
             verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
             authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
+            logoutStore = new RedisStore({ sendCommand, prefix: 'rl:logout:' });
             adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
             forgotPasswordStore = new RedisStore({ sendCommand, prefix: 'rl:forgot-password:' });
             resetPasswordConfirmStore = new RedisStore({ sendCommand, prefix: 'rl:reset-password:' });
@@ -3524,6 +3529,14 @@ void (async () => {
             legacyHeaders: false,
             message: 'Zu viele Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
             ...(authPageStore ? { store: authPageStore } : {}),
+        });
+        logoutLimiter = rateLimit({
+            windowMs: LOGOUT_LIMITER_WINDOW_S * 1000,
+            limit: LOGOUT_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Logout-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
+            ...(logoutStore ? { store: logoutStore } : {}),
         });
         adminLastSeenLimiter = rateLimit({
             windowMs: ADMIN_LAST_SEEN_LIMITER_WINDOW_S * 1000,
@@ -3597,7 +3610,7 @@ void (async () => {
         app.post('/passkey/auth/verify', passkeyAuthLimiter, passkeyAuthVerifyHandler);
         app.get('/passkey/credentials', passkeyCredentialsLimiter, passkeyCredentialsHandler);
         app.post('/passkey/credentials/delete', passkeyRegisterLimiter, passkeyCredentialDeleteHandler);
-        app.get('/logout', logoutHandler);
+        app.get('/logout', logoutLimiter, logoutHandler);
         app.get('/verify', verifyLimiter, verifyHandler);
         app.get('/admin/last-seen', adminLastSeenLimiter, adminLastSeenHandler);
         app.get('/admin/sessions', adminLastSeenLimiter, adminSessionsHandler);

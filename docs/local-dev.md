@@ -44,3 +44,5 @@ Hinweis:
 - In-Memory-Daten gehen beim Neustart verloren (gewollt für Dev).
 - Passkey-UI ist in diesem Dev-Start standardmäßig aktiv.
 - In Production ist `INMEMORY_FALLBACK` blockiert.
+- Der Password-Reset-Flow ist nur im Postgres-Identity-Modus aktiv (`USER_STORE_BACKEND=postgres`).
+- Für lokale Mail-Tests ohne Versand kann `EMAIL_PROVIDER=noop` verwendet werden (Default).

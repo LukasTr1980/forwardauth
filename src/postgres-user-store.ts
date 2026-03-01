@@ -15,6 +15,7 @@ export interface UserAuthRecord {
 export interface UserStore {
     getUserByEmail(email: string): Promise<UserAuthRecord | null>;
     getUserById(id: string): Promise<UserAuthRecord | null>;
+    updatePasswordHashById?(id: string, passwordHash: string): Promise<boolean>;
     loadInitial(): Promise<void>;
     reload?(): Promise<void>;
 }
@@ -100,5 +101,13 @@ export class PostgresUserStore implements UserStore {
         `, [id]);
         const row = result.rows[0];
         return row ? mapRow(row) : null;
+    }
+
+    async updatePasswordHashById(id: string, passwordHash: string): Promise<boolean> {
+        const result = await this.pool.query(
+            'UPDATE users SET password_hash = $1 WHERE id = $2 AND disabled_at IS NULL',
+            [passwordHash, id],
+        );
+        return (result.rowCount ?? 0) > 0;
     }
 }

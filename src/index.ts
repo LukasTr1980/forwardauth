@@ -29,6 +29,11 @@ import {
     type UserAuthRecord,
     type UserStore,
 } from './postgres-user-store.js';
+import { createEmailService } from './email-service.js';
+import {
+    PostgresPasswordResetStore,
+    type PasswordResetStore,
+} from './postgres-password-reset-store.js';
 // CSRF cookie removed; we rely on Origin/Referer checks for POST /auth
 
 interface User {
@@ -47,6 +52,20 @@ interface LoginBody {
     email?: string;
     password?: string;
     redirect_uri?: string;
+}
+
+interface ForgotPasswordBody {
+    email?: string;
+}
+
+interface ResetPasswordQuery {
+    token?: string;
+}
+
+interface ResetPasswordBody {
+    token?: string;
+    password?: string;
+    password_confirm?: string;
 }
 
 interface PasskeyAuthOptionsBody {
@@ -109,10 +128,51 @@ function parseRequiredLoginEmail(value: unknown): string {
     return normalized;
 }
 
+function parseOptionalEmail(value: unknown): string | null {
+    if (typeof value !== 'string') {
+        return null;
+    }
+
+    const normalized = normalizeEmailIdentifier(value);
+    if (!normalized) {
+        return null;
+    }
+
+    const valid = validator.isEmail(normalized, {
+        allow_utf8_local_part: false,
+        require_tld: true,
+        allow_ip_domain: false,
+        domain_specific_validation: true,
+    });
+    return valid ? normalized : null;
+}
+
+function parsePasswordResetToken(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const token = value.trim();
+    if (!token) return null;
+    if (token.length < 32 || token.length > 256) return null;
+    if (!/^[A-Za-z0-9_-]+$/.test(token)) return null;
+    return token;
+}
+
 function normalizePathPrefix(prefix: string): string {
     if (!prefix) return '';
     if (!prefix.startsWith('/')) return `/${prefix}`;
     return prefix;
+}
+
+function parseAbsoluteHttpUrl(value: string, configName: string): URL {
+    try {
+        const url = new URL(value);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            throw new Error('unsupported protocol');
+        }
+        return url;
+    } catch {
+        logger.error(`[config] FATAL: ${configName} must be a valid http(s) URL.`);
+        process.exit(1);
+    }
 }
 
 // Simple log level gate: LOG_LEVEL=debug|info|warn|error|silent (default: info)
@@ -174,14 +234,29 @@ const DOMAIN = process.env.DOMAIN;
 const DOMAIN_WILDCARD = DOMAIN ? `https://*.${DOMAIN}` : undefined;
 const ROOT_DOMAIN = DOMAIN ? `https://${DOMAIN}` : undefined;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3000/auth';
-const AUTH_ORIGIN = new URL(LOGIN_REDIRECT_URL).origin;
+const LOGIN_REDIRECT_PARSED = parseAbsoluteHttpUrl(LOGIN_REDIRECT_URL, 'LOGIN_REDIRECT_URL');
+const AUTH_ORIGIN = LOGIN_REDIRECT_PARSED.origin;
 // Brand name used in simple page layout: prefer cookie domain, else login host
-const BRAND_NAME = DOMAIN ?? new URL(LOGIN_REDIRECT_URL).hostname;
+const BRAND_NAME = DOMAIN ?? LOGIN_REDIRECT_PARSED.hostname;
 const BRAND_AUTH_LABEL = process.env.BRAND_AUTH_LABEL ?? `${BRAND_NAME} Auth`;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
 const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
 const ADULT_PATH_PREFIXES = parseCsvList(process.env.ADULT_PATH_PREFIXES).map(normalizePathPrefix).filter(Boolean);
+const PASSWORD_RESET_ENABLED = USER_STORE_BACKEND === 'postgres';
+const PASSWORD_RESET_TOKEN_TTL_S = getEnvAsNumber('PASSWORD_RESET_TOKEN_TTL_S', 30 * 60);
+const PASSWORD_RESET_LIMITER_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_LIMITER_WINDOW_S', 15 * 60);
+const PASSWORD_RESET_LIMITER_MAX = getEnvAsNumber('PASSWORD_RESET_LIMITER_MAX', 10);
+const PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S', 15 * 60);
+const PASSWORD_RESET_CONFIRM_LIMITER_MAX = getEnvAsNumber('PASSWORD_RESET_CONFIRM_LIMITER_MAX', 10);
+const PASSWORD_MIN_LENGTH = getEnvAsNumber('PASSWORD_MIN_LENGTH', 12);
+const PASSWORD_MAX_LENGTH = getEnvAsNumber('PASSWORD_MAX_LENGTH', 256);
+const PASSWORD_RESET_RESPONSE_FLOOR_MS = getEnvAsNumber('PASSWORD_RESET_RESPONSE_FLOOR_MS', 250);
+const PASSWORD_RESET_URL_BASE = process.env.PASSWORD_RESET_URL_BASE ?? `${AUTH_ORIGIN}/auth/reset-password`;
+const PASSWORD_RESET_URL_BASE_PARSED = parseAbsoluteHttpUrl(PASSWORD_RESET_URL_BASE, 'PASSWORD_RESET_URL_BASE');
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER === 'resend' ? 'resend' : 'noop';
+const EMAIL_FROM = process.env.EMAIL_FROM ?? `${BRAND_AUTH_LABEL} <no-reply@${LOGIN_REDIRECT_PARSED.hostname}>`;
+const EMAIL_REQUEST_TIMEOUT_MS = getEnvAsNumber('EMAIL_REQUEST_TIMEOUT_MS', 10000);
 const PASSKEY_ENABLED = process.env.PASSKEY_ENABLED === '1' || process.env.PASSKEY_ENABLED === 'true';
 const PASSKEY_RP_ID = process.env.PASSKEY_RP_ID ?? DOMAIN;
 const PASSKEY_RP_NAME = process.env.PASSKEY_RP_NAME ?? BRAND_NAME;
@@ -242,6 +317,7 @@ function getEnvSecret(key: string, fileKey: string): string | undefined {
 }
 
 const IDENTITY_DATABASE_URL = getEnvSecret('IDENTITY_DATABASE_URL', 'IDENTITY_DATABASE_URL_FILE');
+const RESEND_API_KEY = getEnvSecret('RESEND_API_KEY', 'RESEND_API_KEY_FILE');
 
 if (USER_STORE_BACKEND === 'postgres' && !IDENTITY_DATABASE_URL) {
     logger.error('[config] FATAL: USER_STORE_BACKEND=postgres requires IDENTITY_DATABASE_URL or IDENTITY_DATABASE_URL_FILE.');
@@ -611,6 +687,8 @@ let loginStore: RateLimitStore | undefined;
 let verifyStore: RateLimitStore | undefined;
 let authPageStore: RateLimitStore | undefined;
 let adminLastSeenStore: RateLimitStore | undefined;
+let forgotPasswordStore: RateLimitStore | undefined;
+let resetPasswordConfirmStore: RateLimitStore | undefined;
 let passkeyAuthStore: RateLimitStore | undefined;
 let passkeyRegisterStore: RateLimitStore | undefined;
 let passkeyCredentialsStore: RateLimitStore | undefined;
@@ -669,10 +747,13 @@ function logStartupConfig(): void {
         `[config] auth: domain=${DOMAIN ?? '(unset)'} cookieName=${COOKIE_NAME} jwtIssuer=${JWT_ISSUER} loginRedirectUrl=${LOGIN_REDIRECT_URL} cookieMaxAgeS=${COOKIE_MAX_AGE_S} maxSessionsPerUser=${MAX_SESSIONS_PER_USER}`
     );
     logger.info(
-        `[config] users: backend=${USER_STORE_BACKEND} file=${USER_FILE} watchIntervalMs=${USER_FILE_WATCH_INTERVAL_MS} identityDb=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} identityDbSsl=${IDENTITY_DB_SSL ? 'on' : 'off'} identityDbPoolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'})`
+        `[config] users: backend=${USER_STORE_BACKEND} file=${USER_FILE} watchIntervalMs=${USER_FILE_WATCH_INTERVAL_MS} identityDb=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} identityDbSsl=${IDENTITY_DB_SSL ? 'on' : 'off'} identityDbPoolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'}, resendApiKey=${RESEND_API_KEY ? 'set' : 'unset'})`
     );
     logger.info(
-        `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s`
+        `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s forgotPassword=${PASSWORD_RESET_LIMITER_MAX}/${PASSWORD_RESET_LIMITER_WINDOW_S}s resetPassword=${PASSWORD_RESET_CONFIRM_LIMITER_MAX}/${PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S}s`
+    );
+    logger.info(
+        `[config] password-reset/email: enabled=${PASSWORD_RESET_ENABLED} tokenTtlS=${PASSWORD_RESET_TOKEN_TTL_S} resetUrlBase=${PASSWORD_RESET_URL_BASE_PARSED.toString()} passwordMinLength=${PASSWORD_MIN_LENGTH} passwordMaxLength=${PASSWORD_MAX_LENGTH} emailProvider=${EMAIL_PROVIDER} emailFrom=${EMAIL_FROM}`
     );
     logger.info(
         `[config] passkey-rate-limits: auth=${PASSKEY_LOGIN_LIMITER_MAX}/${PASSKEY_LOGIN_LIMITER_WINDOW_S}s register=${PASSKEY_REGISTER_LIMITER_MAX}/${PASSKEY_REGISTER_LIMITER_WINDOW_S}s credentials=${PASSKEY_CREDENTIALS_LIMITER_MAX}/${PASSKEY_CREDENTIALS_LIMITER_WINDOW_S}s`
@@ -744,6 +825,8 @@ let loginLimiter: RequestHandler;
 let verifyLimiter: RequestHandler;
 let authPageLimiter: RequestHandler;
 let adminLastSeenLimiter: RequestHandler;
+let forgotPasswordLimiter: RequestHandler;
+let resetPasswordConfirmLimiter: RequestHandler;
 let passkeyAuthLimiter: RequestHandler;
 let passkeyRegisterLimiter: RequestHandler;
 let passkeyCredentialsLimiter: RequestHandler;
@@ -1038,10 +1121,40 @@ function createUserStore(): UserStore {
 }
 
 const userStore: UserStore = createUserStore();
+const passwordResetTokenStore: PasswordResetStore | null = PASSWORD_RESET_ENABLED
+    ? new PostgresPasswordResetStore({
+        databaseUrl: IDENTITY_DATABASE_URL ?? '',
+        maxPoolSize: IDENTITY_DB_POOL_MAX,
+        ssl: IDENTITY_DB_SSL,
+    })
+    : null;
+
+function createConfiguredEmailService(): ReturnType<typeof createEmailService> {
+    try {
+        return createEmailService({
+            provider: EMAIL_PROVIDER,
+            logger,
+            resendApiKey: RESEND_API_KEY,
+            emailFrom: EMAIL_FROM,
+            requestTimeoutMs: EMAIL_REQUEST_TIMEOUT_MS,
+        });
+    } catch (error) {
+        logger.error('[config] FATAL: Invalid email configuration.', error);
+        process.exit(1);
+    }
+}
+
+const emailService = createConfiguredEmailService();
 
 async function initializeUserStore(): Promise<void> {
     await userStore.loadInitial();
     logger.info(`[users] User store initialized (${USER_STORE_BACKEND})`);
+}
+
+async function initializePasswordResetStore(): Promise<void> {
+    if (!passwordResetTokenStore) return;
+    await passwordResetTokenStore.loadInitial();
+    logger.info('[password-reset] Token store initialized (postgres)');
 }
 
 function validateRedirectUri(uri: string): string {
@@ -1139,6 +1252,13 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
             <script src="/passkey.js" defer></script>
         `
         : '';
+    const forgotPasswordHtml = PASSWORD_RESET_ENABLED
+        ? `
+            <p class="meta">
+                <a class="inline-link" href="/auth/forgot-password">Passwort vergessen?</a>
+            </p>
+        `
+        : '';
 
     return `
         <section class="content-stack">
@@ -1155,6 +1275,7 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
                 </div>
                 <button type="submit">Anmelden</button>
             </form>
+            ${forgotPasswordHtml}
             ${passkeySection}
         </section>
     `;
@@ -1245,6 +1366,84 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
     `;
 }
 
+function buildPasswordResetUnavailableBody(): string {
+    return `
+        <section class="content-stack">
+            <h1>Funktion nicht verfügbar</h1>
+            <p>Das Zurücksetzen von Passwörtern ist in dieser Umgebung nicht aktiviert.</p>
+            <div class="action-row">
+                <a class="button button--primary" href="/auth">Zur Anmeldung</a>
+            </div>
+        </section>
+    `;
+}
+
+function buildForgotPasswordFormBody(messageHtml = ''): string {
+    return `
+        <section class="content-stack">
+            <h1>Passwort vergessen?</h1>
+            <p>Geben Sie Ihre E-Mail-Adresse ein. Wenn ein Konto existiert, senden wir Ihnen einen Link zum Zurücksetzen.</p>
+            ${messageHtml}
+            <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth/forgot-password">
+                <div class="field">
+                    <label for="forgot-email">E-Mail-Adresse</label>
+                    <input id="forgot-email" name="email" type="email" placeholder="name@example.com" required autocomplete="email" />
+                </div>
+                <button type="submit">Reset-Link anfordern</button>
+            </form>
+            <p class="meta"><a class="inline-link" href="/auth">Zurück zur Anmeldung</a></p>
+        </section>
+    `;
+}
+
+function buildForgotPasswordSubmittedBody(): string {
+    return `
+        <section class="content-stack">
+            <h1>Wenn ein Konto existiert</h1>
+            <p>haben wir eine E-Mail mit weiteren Schritten gesendet.</p>
+            <p class="meta">Bitte prüfen Sie auch Ihren Spam-Ordner. Der Link ist zeitlich begrenzt gültig.</p>
+            <div class="action-row">
+                <a class="button button--primary" href="/auth">Zur Anmeldung</a>
+            </div>
+        </section>
+    `;
+}
+
+function buildResetPasswordFormBody(token: string, messageHtml = ''): string {
+    return `
+        <section class="content-stack">
+            <h1>Neues Passwort setzen</h1>
+            <p>Bitte vergeben Sie ein neues Passwort.</p>
+            ${messageHtml}
+            <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth/reset-password">
+                <input type="hidden" name="token" value="${he.encode(token)}" />
+                <div class="field">
+                    <label for="reset-password">Neues Passwort</label>
+                    <input id="reset-password" name="password" type="password" required autocomplete="new-password" />
+                </div>
+                <div class="field">
+                    <label for="reset-password-confirm">Neues Passwort bestätigen</label>
+                    <input id="reset-password-confirm" name="password_confirm" type="password" required autocomplete="new-password" />
+                </div>
+                <button type="submit">Passwort speichern</button>
+            </form>
+            <p class="meta"><a class="inline-link" href="/auth">Zur Anmeldung</a></p>
+        </section>
+    `;
+}
+
+function buildResetPasswordSuccessBody(): string {
+    return `
+        <section class="content-stack">
+            <h1>Passwort aktualisiert</h1>
+            <p>Ihr Passwort wurde erfolgreich geändert. Bitte melden Sie sich neu an.</p>
+            <div class="action-row">
+                <a class="button button--primary" href="/auth">Zur Anmeldung</a>
+            </div>
+        </section>
+    `;
+}
+
 function buildAdminNav(activePage: 'sessions' | 'last-seen'): string {
     const sessionsClass = activePage === 'sessions' ? 'subnav-link is-active' : 'subnav-link';
     const lastSeenClass = activePage === 'last-seen' ? 'subnav-link is-active' : 'subnav-link';
@@ -1268,6 +1467,7 @@ interface SessionStore {
     addSession(user: string, jti: string, ttlSeconds: number, maxSessions: number): Promise<boolean>;
     isActive(user: string, jti: string): Promise<boolean>;
     removeSession(user: string, jti: string): Promise<void>;
+    removeAllSessions(user: string): Promise<number>;
 }
 
 class RedisSessionStore implements SessionStore {
@@ -1331,6 +1531,23 @@ class RedisSessionStore implements SessionStore {
             .del(this.keySession(jti))
             .zRem(this.keyUser(user), jti)
             .exec();
+    }
+
+    async removeAllSessions(user: string): Promise<number> {
+        const userKey = this.keyUser(user);
+        const jtis = await this.client.zRange(userKey, 0, -1);
+        if (jtis.length === 0) {
+            await this.client.del(userKey);
+            return 0;
+        }
+
+        const multi = this.client.multi();
+        for (const jti of jtis) {
+            multi.del(this.keySession(jti));
+        }
+        multi.del(userKey);
+        await multi.exec();
+        return jtis.length;
     }
 }
 
@@ -1987,6 +2204,27 @@ function getRequiredTrimmedString(value: unknown): string | null {
     return trimmed.length > 0 ? trimmed : null;
 }
 
+function delay(ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRequiredNewPassword(value: unknown): string {
+    if (typeof value !== 'string') {
+        throw new Error('Bitte geben Sie ein neues Passwort ein.');
+    }
+
+    if (value.length < PASSWORD_MIN_LENGTH) {
+        throw new Error(`Das Passwort muss mindestens ${PASSWORD_MIN_LENGTH} Zeichen lang sein.`);
+    }
+
+    if (value.length > PASSWORD_MAX_LENGTH) {
+        throw new Error(`Das Passwort darf höchstens ${PASSWORD_MAX_LENGTH} Zeichen lang sein.`);
+    }
+
+    return value;
+}
+
 function isRegistrationResponseJson(value: unknown): value is RegistrationResponseJSON {
     if (!isObjectRecord(value)) return false;
     if (typeof value.id !== 'string' || typeof value.rawId !== 'string' || value.type !== 'public-key') return false;
@@ -2405,6 +2643,178 @@ const passkeyCredentialDeleteHandler: RequestHandler<ParamsDictionary, unknown, 
 
     logger.debug(`[passkey] credential deleted for "${auth.user.email}" (${redactedCredentialId(credentialId)})`);
     res.status(200).json({ ok: true });
+};
+
+function buildPasswordResetLink(token: string): string {
+    const url = new URL(PASSWORD_RESET_URL_BASE_PARSED.toString());
+    url.searchParams.set('token', token);
+    return url.toString();
+}
+
+const forgotPasswordPageHandler: RequestHandler = (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!passwordResetTokenStore) {
+        res.status(404).send(getPageHTML('Nicht verfügbar', buildPasswordResetUnavailableBody()));
+        return;
+    }
+
+    res.status(200).send(getPageHTML('Passwort vergessen', buildForgotPasswordFormBody()));
+};
+
+const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, ForgotPasswordBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!passwordResetTokenStore) {
+        res.status(404).send(getPageHTML('Nicht verfügbar', buildPasswordResetUnavailableBody()));
+        return;
+    }
+
+    const sourceIp = req.ip ?? 'unknown';
+    const requestStartedAt = Date.now();
+
+    try {
+        if (!isAllowedAuthPost(req as Request)) {
+            logger.warn(`[password-reset] Cross-site forgot-password blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+            const body = '<div class="alert alert--error">Ungültige Anfrageherkunft.</div>';
+            res.status(403).send(getPageHTML('Zugriff verweigert', body));
+            return;
+        }
+
+        const email = parseOptionalEmail(req.body?.email);
+        if (email) {
+            const userRecord = await userStore.getUserByEmail(email);
+            if (userRecord) {
+                const issued = await passwordResetTokenStore.issueTokenForUser({
+                    userId: userRecord.id,
+                    ttlSeconds: PASSWORD_RESET_TOKEN_TTL_S,
+                    requestedIp: sourceIp,
+                    requestedUserAgent: getHeaderString(req as Request, 'user-agent') || 'unknown',
+                });
+                const resetUrl = buildPasswordResetLink(issued.token);
+                const expiresInMinutes = Math.max(1, Math.floor(PASSWORD_RESET_TOKEN_TTL_S / 60));
+                await emailService.sendPasswordResetEmail({
+                    to: userRecord.email,
+                    resetUrl,
+                    expiresInMinutes,
+                    brandLabel: BRAND_AUTH_LABEL,
+                });
+                logger.info(`[password-reset] Reset email queued for user "${userRecord.id}" from IP ${sourceIp}`);
+            }
+        }
+    } catch (error) {
+        logger.error('[password-reset] Failed while processing forgot-password request.', error);
+    } finally {
+        const elapsed = Date.now() - requestStartedAt;
+        await delay(PASSWORD_RESET_RESPONSE_FLOOR_MS - elapsed);
+    }
+
+    res.status(200).send(getPageHTML('Passwort zurücksetzen', buildForgotPasswordSubmittedBody()));
+};
+
+const resetPasswordPageHandler: RequestHandler<ParamsDictionary, string, unknown, ResetPasswordQuery> = (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!passwordResetTokenStore) {
+        res.status(404).send(getPageHTML('Nicht verfügbar', buildPasswordResetUnavailableBody()));
+        return;
+    }
+
+    const token = parsePasswordResetToken(req.query.token);
+    if (!token) {
+        const body = `
+            <section class="content-stack">
+                <h1>Link ungültig</h1>
+                <div class="alert alert--error">Der Passwort-Reset-Link ist ungültig oder abgelaufen.</div>
+                <div class="action-row">
+                    <a class="button button--primary" href="/auth/forgot-password">Neuen Link anfordern</a>
+                </div>
+            </section>
+        `;
+        res.status(400).send(getPageHTML('Passwort zurücksetzen', body));
+        return;
+    }
+
+    res.status(200).send(getPageHTML('Passwort zurücksetzen', buildResetPasswordFormBody(token)));
+};
+
+const resetPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, ResetPasswordBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (!passwordResetTokenStore) {
+        res.status(404).send(getPageHTML('Nicht verfügbar', buildPasswordResetUnavailableBody()));
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[password-reset] Cross-site reset-password blocked from IP: ${req.ip ?? 'unknown'} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+        const body = '<div class="alert alert--error">Ungültige Anfrageherkunft.</div>';
+        res.status(403).send(getPageHTML('Zugriff verweigert', body));
+        return;
+    }
+
+    const token = parsePasswordResetToken(req.body?.token);
+    if (!token) {
+        const body = `
+            <section class="content-stack">
+                <h1>Link ungültig</h1>
+                <div class="alert alert--error">Der Passwort-Reset-Link ist ungültig oder abgelaufen.</div>
+                <div class="action-row">
+                    <a class="button button--primary" href="/auth/forgot-password">Neuen Link anfordern</a>
+                </div>
+            </section>
+        `;
+        res.status(400).send(getPageHTML('Passwort zurücksetzen', body));
+        return;
+    }
+
+    let password: string;
+    try {
+        password = parseRequiredNewPassword(req.body?.password);
+    } catch (error) {
+        const message = `<div class="alert alert--error">${he.encode((error as Error).message)}</div>`;
+        res.status(400).send(getPageHTML('Passwort zurücksetzen', buildResetPasswordFormBody(token, message)));
+        return;
+    }
+
+    const passwordConfirm = typeof req.body?.password_confirm === 'string' ? req.body.password_confirm : '';
+    if (password !== passwordConfirm) {
+        const message = '<div class="alert alert--error">Die Passwörter stimmen nicht überein.</div>';
+        res.status(400).send(getPageHTML('Passwort zurücksetzen', buildResetPasswordFormBody(token, message)));
+        return;
+    }
+
+    try {
+        const passwordHash = await argon2.hash(password);
+        const userId = await passwordResetTokenStore.consumeTokenAndUpdatePassword(token, passwordHash);
+        if (!userId) {
+            const body = `
+                <section class="content-stack">
+                    <h1>Link ungültig</h1>
+                    <div class="alert alert--error">Der Passwort-Reset-Link ist ungültig oder abgelaufen.</div>
+                    <div class="action-row">
+                        <a class="button button--primary" href="/auth/forgot-password">Neuen Link anfordern</a>
+                    </div>
+                </section>
+            `;
+            res.status(400).send(getPageHTML('Passwort zurücksetzen', body));
+            return;
+        }
+
+        const revokedSessions = await sessionStore.removeAllSessions(userId);
+        const sessionCookieOptions: cookie.SerializeOptions = { maxAge: 0, domain: DOMAIN, httpOnly: true, secure: true, sameSite: 'strict', path: '/' };
+        if (!DOMAIN) delete sessionCookieOptions.domain;
+        res.setHeader('Set-Cookie', [
+            cookie.serialize(COOKIE_NAME, '', sessionCookieOptions),
+        ]);
+
+        logger.info(`[password-reset] Password reset successful for user "${userId}" (revokedSessions=${revokedSessions})`);
+        res.status(200).send(getPageHTML('Passwort aktualisiert', buildResetPasswordSuccessBody()));
+    } catch (error) {
+        logger.error('[password-reset] Failed to reset password.', error);
+        const body = '<div class="alert alert--error"><strong>Es ist ein Fehler aufgetreten.</strong> Bitte versuchen Sie es später erneut.</div>';
+        res.status(500).send(getPageHTML('Fehler', body));
+    }
 };
 
 const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>, string, LoginBody, LoginQuery> = async (req, res) => {
@@ -2827,27 +3237,15 @@ const adminSessionsRevokeHandler: RequestHandler<ParamsDictionary, string, Admin
         return;
     }
 
-    const userKey = `${SESSION_USER_PREFIX}${user}`;
-    let jtis: string[] = [];
+    let revokedCount = 0;
     try {
-        jtis = await redisClient.zRange(userKey, 0, -1);
+        revokedCount = await sessionStore.removeAllSessions(user);
     } catch (error) {
-        logger.error(`[admin] Failed to fetch sessions for "${user}"`, error);
+        logger.error(`[admin] Failed to revoke sessions for "${user}"`, error);
     }
 
-    if (jtis.length > 0) {
-        const multi = redisClient.multi();
-        for (const jti of jtis) {
-            multi.del(`${SESSION_TOKEN_PREFIX}${jti}`);
-        }
-        multi.del(userKey);
-        await multi.exec();
-    } else {
-        await redisClient.del(userKey);
-    }
-
-    logger.info(`[admin] Sessions revoked for user "${user}" by "${adminUser}" (jtis=${jtis.length})`);
-    const notice = encodeURIComponent(`Sitzungen für "${user}" gelöscht (${jtis.length}).`);
+    logger.info(`[admin] Sessions revoked for user "${user}" by "${adminUser}" (jtis=${revokedCount})`);
+    const notice = encodeURIComponent(`Sitzungen für "${user}" gelöscht (${revokedCount}).`);
     res.redirect(`/admin/sessions?notice=${notice}`);
 };
 
@@ -2881,6 +3279,7 @@ const adminSessionsCleanupHandler: RequestHandler = async (req, res) => {
 
 void (async () => {
     await initializeUserStore();
+    await initializePasswordResetStore();
 
     // Log effective configuration once at startup (secrets masked)
     logStartupConfig();
@@ -2904,6 +3303,8 @@ void (async () => {
             verifyStore = new RedisStore({ sendCommand, prefix: 'rl:verify:' });
             authPageStore = new RedisStore({ sendCommand, prefix: 'rl:authpage:' });
             adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
+            forgotPasswordStore = new RedisStore({ sendCommand, prefix: 'rl:forgot-password:' });
+            resetPasswordConfirmStore = new RedisStore({ sendCommand, prefix: 'rl:reset-password:' });
             passkeyAuthStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-auth:' });
             passkeyRegisterStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-register:' });
             passkeyCredentialsStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-credentials:' });
@@ -2942,6 +3343,22 @@ void (async () => {
             message: 'Zu viele Admin-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
             ...(adminLastSeenStore ? { store: adminLastSeenStore } : {}),
         });
+        forgotPasswordLimiter = rateLimit({
+            windowMs: PASSWORD_RESET_LIMITER_WINDOW_S * 1000,
+            limit: PASSWORD_RESET_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Passwort-Reset-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
+            ...(forgotPasswordStore ? { store: forgotPasswordStore } : {}),
+        });
+        resetPasswordConfirmLimiter = rateLimit({
+            windowMs: PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S * 1000,
+            limit: PASSWORD_RESET_CONFIRM_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Passwort-Reset-Bestätigungen von dieser IP. Bitte versuchen Sie es später erneut.',
+            ...(resetPasswordConfirmStore ? { store: resetPasswordConfirmStore } : {}),
+        });
         passkeyAuthLimiter = rateLimit({
             windowMs: PASSKEY_LOGIN_LIMITER_WINDOW_S * 1000,
             limit: PASSKEY_LOGIN_LIMITER_MAX,
@@ -2977,6 +3394,10 @@ void (async () => {
         app.get('/', (req, res) => {
             res.redirect('/auth');
         });
+        app.get('/auth/forgot-password', authPageLimiter, forgotPasswordPageHandler);
+        app.post('/auth/forgot-password', forgotPasswordLimiter, forgotPasswordSubmitHandler);
+        app.get('/auth/reset-password', authPageLimiter, resetPasswordPageHandler);
+        app.post('/auth/reset-password', resetPasswordConfirmLimiter, resetPasswordSubmitHandler);
         app.post('/auth', loginLimiter, loginPageHandler);
         app.get('/auth', authPageLimiter, loginPageHandler);
         app.get('/auth/status', verifyLimiter, statusHandler);

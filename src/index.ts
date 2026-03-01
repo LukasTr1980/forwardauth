@@ -20,7 +20,7 @@ import { readFileSync } from 'node:fs';
 import helmet from 'helmet';
 import he from 'he';
 import validator from 'validator';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
     PostgresUserStore,
     type UserAuthRecord,
@@ -33,19 +33,26 @@ import {
 // CSRF cookie removed; we rely on Origin/Referer checks for POST /auth
 
 interface LoginQuery {
-    redirect_uri?: string;
+    state?: string;
     setup_passkey?: string;
+    redirect_uri?: string;
 }
 
 interface LoginBody {
     email?: string;
     password?: string;
+    state?: string;
     redirect_uri?: string;
+}
+
+interface AuthStateQuery {
+    state?: string;
 }
 
 interface ForgotPasswordBody {
     email?: string;
     'cf-turnstile-response'?: string;
+    state?: string;
 }
 
 interface ResetPasswordQuery {
@@ -60,11 +67,13 @@ interface ResetPasswordBody {
 
 interface PasskeyAuthOptionsBody {
     email?: string;
+    state?: string;
     redirect_uri?: string;
 }
 
 interface PasskeyAuthVerifyBody {
     flowId?: string;
+    state?: string;
     redirect_uri?: string;
     credential?: AuthenticationResponseJSON;
 }
@@ -225,6 +234,13 @@ const ROOT_DOMAIN = DOMAIN ? `https://${DOMAIN}` : undefined;
 const LOGIN_REDIRECT_URL = process.env.LOGIN_REDIRECT_URL ?? 'http://localhost:3000/auth';
 const LOGIN_REDIRECT_PARSED = parseAbsoluteHttpUrl(LOGIN_REDIRECT_URL, 'LOGIN_REDIRECT_URL');
 const AUTH_ORIGIN = LOGIN_REDIRECT_PARSED.origin;
+const LOGIN_INTENT_TTL_S = getEnvAsNumber('LOGIN_INTENT_TTL_S', 10 * 60);
+const LOGIN_INTENT_KEY_PREFIX = process.env.LOGIN_INTENT_KEY_PREFIX ?? 'auth:intent:';
+const LOGIN_FLOW_COOKIE_NAME = process.env.LOGIN_FLOW_COOKIE_NAME ?? 'fwd_login_flow';
+const POST_LOGIN_FALLBACK_URL = parseAbsoluteHttpUrl(
+    process.env.POST_LOGIN_FALLBACK_URL ?? (ROOT_DOMAIN ?? AUTH_ORIGIN),
+    'POST_LOGIN_FALLBACK_URL'
+).toString();
 // Brand name used in simple page layout: prefer cookie domain, else login host
 const BRAND_NAME = DOMAIN ?? LOGIN_REDIRECT_PARSED.hostname;
 const BRAND_AUTH_LABEL = process.env.BRAND_AUTH_LABEL ?? `${BRAND_NAME} Auth`;
@@ -790,7 +806,7 @@ function logStartupConfig(): void {
         `[config] runtime: nodeEnv=${NODE_ENV} port=${PORT} logLevel=${LOG_LEVEL_ENV} inMemoryFallbackRequested=${INMEMORY_FALLBACK_REQUESTED} inMemoryFallbackActive=${USE_INMEMORY_STORE}`
     );
     logger.info(
-        `[config] auth: domain=${DOMAIN ?? '(unset)'} cookieName=${COOKIE_NAME} jwtIssuer=${JWT_ISSUER} loginRedirectUrl=${LOGIN_REDIRECT_URL} cookieMaxAgeS=${COOKIE_MAX_AGE_S} maxSessionsPerUser=${MAX_SESSIONS_PER_USER}`
+        `[config] auth: domain=${DOMAIN ?? '(unset)'} cookieName=${COOKIE_NAME} jwtIssuer=${JWT_ISSUER} loginRedirectUrl=${LOGIN_REDIRECT_URL} loginIntentTtlS=${LOGIN_INTENT_TTL_S} postLoginFallbackUrl=${POST_LOGIN_FALLBACK_URL} cookieMaxAgeS=${COOKIE_MAX_AGE_S} maxSessionsPerUser=${MAX_SESSIONS_PER_USER}`
     );
     logger.info(
         `[config] identity-db: url=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} ssl=${IDENTITY_DB_SSL ? 'on' : 'off'} poolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'}, resendApiKey=${RESEND_API_KEY ? 'set' : 'unset'})`
@@ -830,13 +846,6 @@ function getHeaderString(req: Pick<Request, 'headers'>, name: string): string {
     const value = req.headers[name.toLowerCase()];
     if (Array.isArray(value)) return value[0] ?? '';
     return typeof value === 'string' ? value : '';
-}
-
-function isAndroidAppWebViewRequest(req: Pick<Request, 'headers'>): boolean {
-    const userAgent = getHeaderString(req, 'user-agent');
-    if (!userAgent) return false;
-    if (!/android/i.test(userAgent)) return false;
-    return userAgent.includes('ChartsCXPlayer/');
 }
 
 function isAllowedAuthPost(req: Request): boolean {
@@ -1004,33 +1013,153 @@ async function initializePasswordResetStore(): Promise<void> {
     logger.info('[password-reset] Token store initialized (postgres)');
 }
 
-function validateRedirectUri(uri: string): string {
-    const defaultRedirect = '/';
-    if (!uri) return defaultRedirect;
+interface LoginIntentRecord {
+    state: string;
+    returnTo: string;
+    createdAt: number;
+}
 
+function parseOpaqueToken(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const token = value.trim();
+    if (!token) return null;
+    if (token.length < 16 || token.length > 256) return null;
+    if (!/^[A-Za-z0-9_-]+$/.test(token)) return null;
+    return token;
+}
+
+function parseLoginFlowId(value: unknown): string | null {
+    return parseOpaqueToken(value);
+}
+
+function parseLoginState(value: unknown): string | null {
+    return parseOpaqueToken(value);
+}
+
+function isAllowedReturnToHostname(hostname: string): boolean {
+    const normalized = hostname.toLowerCase();
+    if (DOMAIN) {
+        const normalizedDomain = DOMAIN.toLowerCase();
+        return normalized === normalizedDomain || normalized.endsWith(`.${normalizedDomain}`);
+    }
+    return normalized === LOGIN_REDIRECT_PARSED.hostname.toLowerCase();
+}
+
+function normalizeAndValidateReturnTo(uri: string): string | null {
+    if (!uri) return null;
     const trimmed = uri.trim();
-
+    if (!trimmed) return null;
     try {
         const url = new URL(trimmed);
-
         if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-            logger.warn('[redirect] Blocked non-http(s) redirect to: %s', trimmed);
-            return defaultRedirect;
+            return null;
         }
-
-        if (DOMAIN && (url.hostname === DOMAIN || url.hostname.endsWith(`.${DOMAIN}`))) {
-            return url.toString();
+        if (!isAllowedReturnToHostname(url.hostname)) {
+            return null;
         }
-
-        logger.warn('[redirect] Blocked potential open redirect to: %s', trimmed);
-        return defaultRedirect;
-    } catch (error) {
-        if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
-            return trimmed;
-        }
-        logger.warn('[redirect] Invalid redirect URI provided: %s', trimmed, error);
-        return defaultRedirect;
+        return url.toString();
+    } catch {
+        return null;
     }
+}
+
+function loginIntentKey(flowId: string): string {
+    return `${LOGIN_INTENT_KEY_PREFIX}${flowId}`;
+}
+
+function getLoginFlowCookieOptions(maxAge: number): cookie.SerializeOptions {
+    const options: cookie.SerializeOptions = {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax',
+        path: '/auth',
+        maxAge,
+    };
+    if (DOMAIN) {
+        options.domain = DOMAIN;
+    }
+    return options;
+}
+
+function parseStoredLoginIntent(raw: string): LoginIntentRecord | null {
+    try {
+        const parsed = JSON.parse(raw) as Partial<LoginIntentRecord>;
+        if (
+            typeof parsed.state !== 'string' ||
+            typeof parsed.returnTo !== 'string' ||
+            typeof parsed.createdAt !== 'number'
+        ) {
+            return null;
+        }
+        const parsedState = parseLoginState(parsed.state);
+        const parsedReturnTo = normalizeAndValidateReturnTo(parsed.returnTo);
+        if (!parsedState || !parsedReturnTo) {
+            return null;
+        }
+        return {
+            state: parsedState,
+            returnTo: parsedReturnTo,
+            createdAt: parsed.createdAt,
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function createOrReplaceLoginIntent(flowId: string, returnTo: string): Promise<LoginIntentRecord> {
+    const state = randomBytes(32).toString('base64url');
+    const record: LoginIntentRecord = {
+        state,
+        returnTo,
+        createdAt: Date.now(),
+    };
+    await redisClient.set(loginIntentKey(flowId), JSON.stringify(record), { EX: LOGIN_INTENT_TTL_S });
+    return record;
+}
+
+async function getLoginIntent(flowId: string): Promise<LoginIntentRecord | null> {
+    const key = loginIntentKey(flowId);
+    const raw = await redisClient.get(key);
+    if (!raw) return null;
+    const parsed = parseStoredLoginIntent(raw);
+    if (!parsed) {
+        await redisClient.del(key);
+        return null;
+    }
+    return parsed;
+}
+
+async function getLoginIntentReturnTo(flowId: string, state: string): Promise<string | null> {
+    const intent = await getLoginIntent(flowId);
+    if (!intent) return null;
+    if (intent.state !== state) return null;
+    return intent.returnTo;
+}
+
+async function consumeLoginIntent(flowId: string, state: string): Promise<string | null> {
+    const key = loginIntentKey(flowId);
+    const intent = await getLoginIntent(flowId);
+    if (!intent) return null;
+    if (intent.state !== state) return null;
+    await redisClient.del(key);
+    return intent.returnTo;
+}
+
+function getAuthPathWithState(path: '/auth' | '/auth/forgot-password' | '/auth/complete', state?: string): string {
+    if (!state) return path;
+    return `${path}?state=${encodeURIComponent(state)}`;
+}
+
+function getLegacyRedirectUri(req: Request): string | undefined {
+    const queryValue = req.query.redirect_uri;
+    if (typeof queryValue === 'string' && queryValue.trim() !== '') {
+        return queryValue;
+    }
+    const bodyValue = (req.body as { redirect_uri?: unknown } | undefined)?.redirect_uri;
+    if (typeof bodyValue === 'string' && bodyValue.trim() !== '') {
+        return bodyValue;
+    }
+    return undefined;
 }
 
 function getOriginalUrl(req: Request): string {
@@ -1082,7 +1211,10 @@ function getSessionCookieOptions(): cookie.SerializeOptions {
     return options;
 }
 
-function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): string {
+function buildLoginFormBody(loginState: string | undefined, headlineHtml: string): string {
+    const safeLoginState = loginState ? he.encode(loginState) : '';
+    const stateHiddenField = loginState ? `<input type="hidden" name="state" value="${safeLoginState}" />` : '';
+    const forgotPasswordHref = getAuthPathWithState('/auth/forgot-password', loginState);
     const passkeySection = PASSKEY_ENABLED
         ? `
             <section class="passkey-box panel panel--soft" aria-labelledby="passkey-login-heading">
@@ -1091,7 +1223,7 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
                     <label for="passkey-login-email">E-Mail-Adresse <span class="optional-note">(OPTIONAL)</span></label>
                     <input id="passkey-login-email" placeholder="name@example.com" autocomplete="email webauthn" />
                 </div>
-                <input id="passkey-login-redirect-uri" type="hidden" value="${safeDestinationUri}" />
+                <input id="passkey-login-state" type="hidden" value="${safeLoginState}" />
                 <input id="passkey-allowed-domain" type="hidden" value="${he.encode(DOMAIN ?? '')}" />
                 <button id="passkey-login-button" type="button">Mit Passkey anmelden</button>
                 <p id="passkey-login-message" class="meta" role="status" aria-live="polite"></p>
@@ -1102,7 +1234,7 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
     const forgotPasswordHtml = PASSWORD_RESET_ENABLED
         ? `
             <p class="meta">
-                <a class="inline-link inline-link--forgot" href="/auth/forgot-password">Passwort vergessen?</a>
+                <a class="inline-link inline-link--forgot" href="${forgotPasswordHref}">Passwort vergessen?</a>
             </p>
         `
         : '';
@@ -1111,7 +1243,7 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
         <section class="content-stack">
             ${headlineHtml}
             <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth">
-                <input type="hidden" name="redirect_uri" value="${safeDestinationUri}" />
+                ${stateHiddenField}
                 <div class="field">
                     <label for="login-email">E-Mail-Adresse</label>
                     <input id="login-email" name="email" type="email" placeholder="name@example.com" required autocomplete="email" />
@@ -1225,7 +1357,10 @@ function buildPasswordResetUnavailableBody(): string {
     `;
 }
 
-function buildForgotPasswordFormBody(messageHtml = ''): string {
+function buildForgotPasswordFormBody(messageHtml = '', loginState?: string): string {
+    const safeLoginState = loginState ? he.encode(loginState) : '';
+    const stateHiddenField = loginState ? `<input type="hidden" name="state" value="${safeLoginState}" />` : '';
+    const backToAuthHref = getAuthPathWithState('/auth', loginState);
     const turnstileHtml = TURNSTILE_FORGOT_PASSWORD_ENABLED
         ? `
             <div class="turnstile-wrap">
@@ -1252,6 +1387,7 @@ function buildForgotPasswordFormBody(messageHtml = ''): string {
             <p>Geben Sie Ihre E-Mail-Adresse ein. Wenn ein Konto existiert, senden wir Ihnen einen Link zum Zurücksetzen.</p>
             ${messageHtml}
             <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth/forgot-password" data-turnstile-required="${turnstileRequiredFlag}">
+                ${stateHiddenField}
                 <div class="field">
                     <label for="forgot-email">E-Mail-Adresse</label>
                     <input id="forgot-email" name="email" type="email" placeholder="name@example.com" required autocomplete="email" />
@@ -1259,19 +1395,20 @@ function buildForgotPasswordFormBody(messageHtml = ''): string {
                 ${turnstileHtml}
                 <button id="forgot-submit-button" type="submit" ${submitDisabledAttribute}>Reset-Link anfordern</button>
             </form>
-            <p class="meta"><a class="inline-link" href="/auth">Zurück zur Anmeldung</a></p>
+            <p class="meta"><a class="inline-link" href="${backToAuthHref}">Zurück zur Anmeldung</a></p>
         </section>
     `;
 }
 
-function buildForgotPasswordSubmittedBody(): string {
+function buildForgotPasswordSubmittedBody(loginState?: string): string {
+    const backToAuthHref = getAuthPathWithState('/auth', loginState);
     return `
         <section class="content-stack">
             <h1>Wenn ein Konto existiert</h1>
             <p>haben wir eine E-Mail mit weiteren Schritten gesendet.</p>
             <p class="meta">Bitte prüfen Sie auch Ihren Spam-Ordner. Der Link ist zeitlich begrenzt gültig.</p>
             <div class="action-row">
-                <a class="button button--primary" href="/auth">Zur Anmeldung</a>
+                <a class="button button--primary" href="${backToAuthHref}">Zur Anmeldung</a>
             </div>
         </section>
     `;
@@ -1675,7 +1812,7 @@ interface StoredPasskeyChallenge {
     flowId: string;
     challenge: string;
     email?: string;
-    redirectUri?: string;
+    loginState?: string;
     createdAt: number;
 }
 
@@ -1783,7 +1920,7 @@ function parseStoredPasskeyChallenge(raw: string): StoredPasskeyChallenge | null
             flowId: parsed.flowId,
             challenge: parsed.challenge,
             email: typeof parsed.email === 'string' ? parsed.email : undefined,
-            redirectUri: typeof parsed.redirectUri === 'string' ? parsed.redirectUri : undefined,
+            loginState: parseLoginState(parsed.loginState) ?? undefined,
             createdAt: parsed.createdAt,
         };
     } catch {
@@ -1997,12 +2134,25 @@ const verifyHandler: RequestHandler = async (req, res) => {
         const reason = (error as Error).message.includes('No token') ? 'No token' : 'Invalid, expired, or inactive session token';
         logger.warn(`[verify] Verification failed for IP ${sourceIp}: ${reason}`);
 
-        const originalUrl = getOriginalUrl(req);
-
-        const loginUrl = new URL(LOGIN_REDIRECT_URL);
-        loginUrl.searchParams.set('redirect_uri', originalUrl);
         if (isDocumentRequest(req)) {
-            res.redirect(303, loginUrl.toString());
+            const originalUrl = getOriginalUrl(req);
+            const validatedReturnTo = normalizeAndValidateReturnTo(originalUrl) ?? POST_LOGIN_FALLBACK_URL;
+            const parsedCookies = cookie.parse(req.headers.cookie ?? '');
+            const existingFlowId = parseLoginFlowId(parsedCookies[LOGIN_FLOW_COOKIE_NAME]);
+            const flowId = existingFlowId ?? randomBytes(24).toString('base64url');
+            try {
+                const intent = await createOrReplaceLoginIntent(flowId, validatedReturnTo);
+                const loginUrl = new URL(LOGIN_REDIRECT_URL);
+                loginUrl.search = '';
+                loginUrl.searchParams.set('state', intent.state);
+                res.setHeader('Set-Cookie', [
+                    cookie.serialize(LOGIN_FLOW_COOKIE_NAME, flowId, getLoginFlowCookieOptions(LOGIN_INTENT_TTL_S)),
+                ]);
+                res.redirect(303, loginUrl.toString());
+            } catch (intentError) {
+                logger.error('[redirect] Failed to create login intent; falling back to auth entry page.', intentError);
+                res.redirect(303, `${AUTH_ORIGIN}/auth`);
+            }
         } else {
             res.status(401).set('Cache-Control', 'no-store').end('Unauthorized');
         }
@@ -2276,6 +2426,32 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
         return;
     }
 
+    const legacyRedirectUri = getLegacyRedirectUri(req as Request);
+    if (legacyRedirectUri) {
+        logger.warn(`[passkey] Rejected legacy redirect_uri on auth/options from IP ${req.ip ?? 'unknown'}`);
+        res.status(400).json({ error: 'Der redirect_uri-Flow wird nicht mehr unterstützt.' });
+        return;
+    }
+
+    const loginState = parseLoginState(req.body?.state);
+    const flowCookies = cookie.parse(req.headers.cookie ?? '');
+    const loginFlowId = parseLoginFlowId(flowCookies[LOGIN_FLOW_COOKIE_NAME]);
+    if (req.body?.state && !loginState) {
+        res.status(400).json({ error: 'state ist ungültig.' });
+        return;
+    }
+    if (loginState && !loginFlowId) {
+        res.status(400).json({ error: 'Login-Flow ist abgelaufen. Bitte Seite neu laden.' });
+        return;
+    }
+    if (loginState && loginFlowId) {
+        const returnTo = await getLoginIntentReturnTo(loginFlowId, loginState);
+        if (!returnTo) {
+            res.status(400).json({ error: 'Login-Flow ist abgelaufen. Bitte Seite neu laden.' });
+            return;
+        }
+    }
+
     const emailInput = getRequiredTrimmedString(req.body?.email);
     const requestedEmail = emailInput ? normalizeEmailIdentifier(emailInput) : undefined;
     let allowCredentials: { id: string; transports?: AuthenticatorTransportFuture[] }[] | undefined;
@@ -2302,12 +2478,11 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
     });
 
     const flowId = randomUUID();
-    const redirectUri = validateRedirectUri(req.body?.redirect_uri ?? '/');
     await storePasskeyChallenge('auth', {
         flowId,
         challenge: options.challenge,
         email: challengeEmail,
-        redirectUri,
+        loginState,
         createdAt: Date.now(),
     });
 
@@ -2326,6 +2501,13 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
     if (!isAllowedAuthPost(req as Request)) {
         logger.warn(`[passkey] Cross-site auth/verify blocked from IP ${req.ip}`);
         res.status(403).json({ error: 'Ungültige Anfrageherkunft.' });
+        return;
+    }
+
+    const legacyRedirectUri = getLegacyRedirectUri(req as Request);
+    if (legacyRedirectUri) {
+        logger.warn(`[passkey] Rejected legacy redirect_uri on auth/verify from IP ${req.ip ?? 'unknown'}`);
+        res.status(400).json({ error: 'Der redirect_uri-Flow wird nicht mehr unterstützt.' });
         return;
     }
 
@@ -2425,10 +2607,17 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
             cookie.serialize(COOKIE_NAME, jwt, getSessionCookieOptions()),
         ]);
 
+        const completionPath = getAuthPathWithState('/auth/complete', challengeState.loginState);
+        const flowCookies = cookie.parse(req.headers.cookie ?? '');
+        const loginFlowId = parseLoginFlowId(flowCookies[LOGIN_FLOW_COOKIE_NAME]);
+        const intentReturnTo = challengeState.loginState && loginFlowId
+            ? await getLoginIntentReturnTo(loginFlowId, challengeState.loginState)
+            : null;
+
         void recordLastSeen(user.id, {
             ip: req.ip ?? 'unknown',
             host: req.hostname || 'unknown',
-            uri: challengeState.redirectUri ?? '/',
+            uri: intentReturnTo ?? POST_LOGIN_FALLBACK_URL,
             userAgent: getHeaderString(req as Request, 'user-agent') || 'unknown',
             platform: getHeaderString(req as Request, 'sec-ch-ua-platform') || undefined,
             via: 'login',
@@ -2438,7 +2627,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         logger.debug(`[passkey] authentication success for user "${user.email}" (${redactedCredentialId(storedCredential.credentialId)})`);
         res.status(200).json({
             ok: true,
-            redirectTo: validateRedirectUri(req.body?.redirect_uri ?? challengeState.redirectUri ?? '/'),
+            redirectTo: completionPath,
         });
     } catch (error) {
         const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
@@ -2603,7 +2792,7 @@ async function verifyForgotPasswordTurnstile(req: Request): Promise<TurnstileVer
     }
 }
 
-const forgotPasswordPageHandler: RequestHandler = (req, res) => {
+const forgotPasswordPageHandler: RequestHandler<ParamsDictionary, string, Record<string, never>, AuthStateQuery> = (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
     if (!passwordResetTokenStore) {
@@ -2611,7 +2800,8 @@ const forgotPasswordPageHandler: RequestHandler = (req, res) => {
         return;
     }
 
-    res.status(200).send(getPageHTML('Passwort vergessen', buildForgotPasswordFormBody()));
+    const loginState = parseLoginState(req.query.state) ?? undefined;
+    res.status(200).send(getPageHTML('Passwort vergessen', buildForgotPasswordFormBody('', loginState)));
 };
 
 const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, ForgotPasswordBody> = async (req, res) => {
@@ -2624,6 +2814,7 @@ const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, Forg
 
     const sourceIp = req.ip ?? 'unknown';
     const requestStartedAt = Date.now();
+    const loginState = parseLoginState(req.body?.state) ?? undefined;
 
     try {
         if (!isAllowedAuthPost(req as Request)) {
@@ -2637,7 +2828,7 @@ const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, Forg
         if (!turnstileResult.ok) {
             logger.warn(`[password-reset] Turnstile verification failed from IP ${sourceIp} (reason=${turnstileResult.reason})`);
             const message = '<div class="alert alert--error">Sicherheitsprüfung fehlgeschlagen. Bitte erneut versuchen.</div>';
-            res.status(400).send(getPageHTML('Passwort vergessen', buildForgotPasswordFormBody(message)));
+            res.status(400).send(getPageHTML('Passwort vergessen', buildForgotPasswordFormBody(message, loginState)));
             return;
         }
 
@@ -2678,7 +2869,7 @@ const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, Forg
         await delay(PASSWORD_RESET_RESPONSE_FLOOR_MS - elapsed);
     }
 
-    res.status(200).send(getPageHTML('Passwort zurücksetzen', buildForgotPasswordSubmittedBody()));
+    res.status(200).send(getPageHTML('Passwort zurücksetzen', buildForgotPasswordSubmittedBody(loginState)));
 };
 
 const resetPasswordPageHandler: RequestHandler<ParamsDictionary, string, unknown, ResetPasswordQuery> = (req, res) => {
@@ -2794,18 +2985,32 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     const platformHeader = getHeaderString(req as Request, 'sec-ch-ua-platform');
     const platform = platformHeader || undefined;
     const requestHost = req.hostname;
-
-    const rawRedirectUri = req.query.redirect_uri ?? req.body?.redirect_uri;
-    const validatedDestinationUri = validateRedirectUri(rawRedirectUri ?? getOriginalUrl(req as Request));
-    const safeDestinationUri = he.encode(validatedDestinationUri);
+    const loginFlowId = parseLoginFlowId(cookies[LOGIN_FLOW_COOKIE_NAME]);
+    const loginState = parseLoginState(req.query.state ?? req.body?.state);
+    const intentReturnTo = loginFlowId && loginState
+        ? await getLoginIntentReturnTo(loginFlowId, loginState)
+        : null;
+    const validatedDestinationUri = intentReturnTo ?? POST_LOGIN_FALLBACK_URL;
+    const completionPath = getAuthPathWithState('/auth/complete', loginState ?? undefined);
     const setupPasskeyRequested = req.query.setup_passkey === '1';
 
     const sourceIp = req.ip ?? 'unknown';
 
+    const legacyRedirectUri = getLegacyRedirectUri(req as Request);
+    if (legacyRedirectUri) {
+        logger.warn(`[auth] Rejected legacy redirect_uri from IP ${sourceIp}`);
+        const body = `
+            <div class="alert alert--error">Dieser Client verwendet einen nicht mehr unterstützten Login-Flow (redirect_uri).</div>
+            <p>Bitte starten Sie die Anmeldung neu über die geschützte Seite.</p>
+        `;
+        res.status(400).send(getPageHTML('Veralteter Login-Flow', body));
+        return;
+    }
+
     if (req.method === 'POST') {
         if (!isAllowedAuthPost(req as Request)) {
             logger.warn(`[auth] Cross-site POST blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
-            const backLink = `${AUTH_ORIGIN}/auth?redirect_uri=${encodeURIComponent(validatedDestinationUri)}`;
+            const backLink = getAuthPathWithState('/auth', loginState ?? undefined);
             const body = `
                 <div class="alert alert--error">Ungültige Anfrageherkunft. Bitte verwenden Sie die offizielle Anmeldeseite.</div>
                 <p><a href="${backLink}">Zur Anmeldeseite</a></p>
@@ -2820,14 +3025,14 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         } catch (error) {
             logger.warn(`[auth] Rejected login with invalid email input from IP: ${sourceIp}`);
             const message = `<div class="alert alert--error">${he.encode((error as Error).message)}</div><h1>Bitte anmelden</h1>`;
-            const loginFormBody = buildLoginFormBody(safeDestinationUri, message);
+            const loginFormBody = buildLoginFormBody(loginState ?? undefined, message);
             res.status(400).send(getPageHTML('Anmeldung', loginFormBody));
             return;
         }
         if (typeof req.body?.password !== 'string') {
             logger.warn(`[auth] Rejected login with invalid password type from IP: ${sourceIp}`);
             const message = '<div class="alert alert--error">Ungültige Anfrage.</div><h1>Bitte anmelden</h1>';
-            const loginFormBody = buildLoginFormBody(safeDestinationUri, message);
+            const loginFormBody = buildLoginFormBody(loginState ?? undefined, message);
             res.status(400).send(getPageHTML('Anmeldung', loginFormBody));
             return;
         }
@@ -2851,7 +3056,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     if (!allowed) {
                         logger.warn(`[auth] BLOCKED: User "${email}" at session limit (${MAX_SESSIONS_PER_USER})`);
                         const message = '<div class="alert alert--error">Zu viele aktive Sitzungen für dieses Konto. Bitte melden Sie sich auf einem anderen Gerät ab und versuchen Sie es erneut.</div>';
-                        const loginFormBody = buildLoginFormBody(safeDestinationUri, `${message}<h1>Bitte anmelden</h1>`);
+                        const loginFormBody = buildLoginFormBody(loginState ?? undefined, `${message}<h1>Bitte anmelden</h1>`);
                         res.status(429).send(getPageHTML('Zu viele Sitzungen', loginFormBody));
                         return;
                     }
@@ -2885,7 +3090,9 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                             const existingPasskeys = await getPasskeyCredentialsForUser(userRecord.id);
                             if (existingPasskeys.length === 0) {
                                 const setupPasskeyUrl = new URL(`${AUTH_ORIGIN}/auth`);
-                                setupPasskeyUrl.searchParams.set('redirect_uri', validatedDestinationUri);
+                                if (loginState) {
+                                    setupPasskeyUrl.searchParams.set('state', loginState);
+                                }
                                 setupPasskeyUrl.searchParams.set('setup_passkey', '1');
                                 res.redirect(303, setupPasskeyUrl.toString());
                                 return;
@@ -2895,7 +3102,11 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                         }
                     }
 
-                    res.redirect(303, validatedDestinationUri);
+                    if (loginState) {
+                        res.redirect(303, completionPath);
+                    } else {
+                        res.redirect(303, validatedDestinationUri);
+                    }
                     return;
                 }
             } catch (error) {
@@ -2930,7 +3141,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                 ]);
 
                 const message = '<div class="alert alert--error">Sie wurden auf diesem Gerät abgemeldet, weil Sie sich an einem anderen Ort angemeldet haben. Bitte melden Sie sich erneut an.</div>';
-                const loginFormBody = buildLoginFormBody(safeDestinationUri, `${message}<h1>Bitte anmelden</h1>`);
+                const loginFormBody = buildLoginFormBody(loginState ?? undefined, `${message}<h1>Bitte anmelden</h1>`);
                 res.status(401).send(getPageHTML('Anmeldung', loginFormBody));
                 return;
             }
@@ -2946,14 +3157,13 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         }
 
         const promptPasskeySetup = PASSKEY_ENABLED && setupPasskeyRequested && !hasPasskey;
-        const hasExplicitRedirectUri = typeof rawRedirectUri === 'string' && rawRedirectUri.trim() !== '';
-        const fromAndroidAppWebView = isAndroidAppWebViewRequest(req);
-        if (req.method === 'GET' && fromAndroidAppWebView && hasExplicitRedirectUri && !promptPasskeySetup) {
-            res.redirect(303, validatedDestinationUri);
+        if (req.method === 'GET' && loginState && !promptPasskeySetup) {
+            res.redirect(303, completionPath);
             return;
         }
 
-        const loggedInBody = buildLoggedInBody(safeDestinationUri, {
+        const safePrimaryAction = he.encode(promptPasskeySetup ? completionPath : validatedDestinationUri);
+        const loggedInBody = buildLoggedInBody(safePrimaryAction, {
             signedInUser: getJwtEmailClaim(payload) ?? currentUser.email,
             setupPasskeyPrompt: promptPasskeySetup,
             autoRedirectAfterPasskeySetup: promptPasskeySetup,
@@ -2967,10 +3177,31 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             ? '<div class="alert alert--error">Ungültige E-Mail oder Passwort.</div><h1>Bitte anmelden</h1>'
             : '<h1>Bitte anmelden</h1>';
 
-        const loginFormBody = buildLoginFormBody(safeDestinationUri, loginMessage);
+        const loginFormBody = buildLoginFormBody(loginState ?? undefined, loginMessage);
 
         res.status(401).send(getPageHTML('Anmeldung', loginFormBody));
     }
+};
+
+const authCompleteHandler: RequestHandler<ParamsDictionary, string, Record<string, never>, AuthStateQuery> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const cookies = cookie.parse(req.headers.cookie ?? '');
+    const flowId = parseLoginFlowId(cookies[LOGIN_FLOW_COOKIE_NAME]);
+    const state = parseLoginState(req.query.state);
+    let target = POST_LOGIN_FALLBACK_URL;
+
+    if (flowId && state) {
+        const consumed = await consumeLoginIntent(flowId, state);
+        if (consumed) {
+            target = consumed;
+        }
+    }
+
+    res.setHeader('Set-Cookie', [
+        cookie.serialize(LOGIN_FLOW_COOKIE_NAME, '', getLoginFlowCookieOptions(0)),
+    ]);
+    res.redirect(303, target);
 };
 
 const logoutHandler: RequestHandler = async (req, res) => {
@@ -3385,6 +3616,7 @@ void (async () => {
         app.post('/auth/reset-password', resetPasswordConfirmLimiter, resetPasswordSubmitHandler);
         app.post('/auth', loginLimiter, loginPageHandler);
         app.get('/auth', authPageLimiter, loginPageHandler);
+        app.get('/auth/complete', authPageLimiter, authCompleteHandler);
         app.get('/auth/status', verifyLimiter, statusHandler);
         app.post('/passkey/register/options', passkeyRegisterLimiter, passkeyRegisterOptionsHandler);
         app.post('/passkey/register/verify', passkeyRegisterLimiter, passkeyRegisterVerifyHandler);

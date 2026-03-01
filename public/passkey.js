@@ -242,7 +242,7 @@
         const button = byId('passkey-login-button');
         if (!button) return;
 
-        const redirectInput = byId('passkey-login-redirect-uri');
+        const stateInput = byId('passkey-login-state');
         const allowedDomain = getAllowedDomain();
         const message = byId('passkey-login-message');
 
@@ -254,14 +254,17 @@
 
         button.addEventListener('click', async () => {
             const email = getLoginEmail();
-            const redirectUri = redirectInput && typeof redirectInput.value === 'string' ? redirectInput.value : '/';
+            const loginState = stateInput && typeof stateInput.value === 'string' ? stateInput.value.trim() : '';
             button.disabled = true;
             setMessage(message, email ? 'Passkey-Anfrage wird gestartet...' : 'Passkey-Discovery wird gestartet...', false);
 
             try {
-                const optionsPayload = { redirect_uri: redirectUri };
+                const optionsPayload = {};
                 if (email) {
                     optionsPayload.email = email;
+                }
+                if (loginState) {
+                    optionsPayload.state = loginState;
                 }
 
                 const optionsResponse = await postJson('/passkey/auth/options', optionsPayload);
@@ -275,7 +278,7 @@
                 const credential = authenticationCredentialToJSON(assertion);
                 const verifyResponse = await postJson('/passkey/auth/verify', {
                     flowId: optionsResponse.flowId,
-                    redirect_uri: redirectUri,
+                    ...(loginState ? { state: loginState } : {}),
                     credential,
                 });
 

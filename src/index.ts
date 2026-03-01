@@ -1444,10 +1444,10 @@ function buildForgotPasswordFormBody(messageHtml = ''): string {
                     data-expired-callback="onForgotPasswordTurnstileExpired"
                     data-error-callback="onForgotPasswordTurnstileError"
                 ></div>
-                <p id="forgot-turnstile-status" class="meta meta--error"><strong>Bitte erst die Sicherheitsprüfung abschließen.</strong></p>
+                <p id="forgot-turnstile-status" class="meta">Sicherheitsprüfung läuft. Bitte kurz warten.</p>
             </div>
-            <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
             <script src="/turnstile.js" defer></script>
+            <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" defer></script>
         `
         : '';
     const submitDisabledAttribute = TURNSTILE_FORGOT_PASSWORD_ENABLED ? 'disabled' : '';

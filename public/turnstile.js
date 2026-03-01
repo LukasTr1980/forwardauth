@@ -1,6 +1,10 @@
 /* global window, document */
 
 (() => {
+    const STATUS_WAITING = 'waiting';
+    const STATUS_SOLVED = 'solved';
+    const STATUS_ERROR = 'error';
+
     function readTurnstileToken(form) {
         const tokenInput = form.querySelector('input[name="cf-turnstile-response"]');
         if (!tokenInput || typeof tokenInput.value !== 'string') {
@@ -9,22 +13,31 @@
         return tokenInput.value.trim();
     }
 
-    function setStatus(statusNode, submitButton, solved) {
+    function setStatus(statusNode, submitButton, status) {
         if (submitButton) {
-            submitButton.disabled = !solved;
+            submitButton.disabled = status !== STATUS_SOLVED;
         }
 
         if (!statusNode) return;
 
         statusNode.classList.remove('meta--error', 'meta--success');
-        if (solved) {
-            statusNode.textContent = 'Sicherheitsprüfung erfolgreich. Sie können jetzt absenden.';
-            statusNode.classList.add('meta--success');
+        if (status === STATUS_SOLVED) {
+            statusNode.textContent = '';
             return;
         }
 
-        statusNode.textContent = 'Bitte erst die Sicherheitsprüfung abschließen.';
-        statusNode.classList.add('meta--error');
+        if (status === STATUS_ERROR) {
+            statusNode.textContent = 'Sicherheitsprüfung fehlgeschlagen. Bitte kurz warten oder Seite neu laden.';
+            statusNode.classList.add('meta--error');
+            return;
+        }
+
+        statusNode.textContent = 'Sicherheitsprüfung läuft. Bitte kurz warten.';
+    }
+
+    function syncStatusFromToken(form, statusNode, submitButton) {
+        const hasToken = readTurnstileToken(form).length > 0;
+        setStatus(statusNode, submitButton, hasToken ? STATUS_SOLVED : STATUS_WAITING);
     }
 
     function initForgotPasswordTurnstileGate() {
@@ -36,24 +49,31 @@
         const submitButton = document.getElementById('forgot-submit-button');
         const statusNode = document.getElementById('forgot-turnstile-status');
 
-        setStatus(statusNode, submitButton, false);
+        syncStatusFromToken(form, statusNode, submitButton);
 
         window.onForgotPasswordTurnstileSuccess = (token) => {
-            const solved = typeof token === 'string' && token.trim().length > 0;
-            setStatus(statusNode, submitButton, solved);
+            const hasToken = typeof token === 'string' && token.trim().length > 0;
+            setStatus(statusNode, submitButton, hasToken ? STATUS_SOLVED : STATUS_WAITING);
         };
         window.onForgotPasswordTurnstileExpired = () => {
-            setStatus(statusNode, submitButton, false);
+            setStatus(statusNode, submitButton, STATUS_WAITING);
         };
         window.onForgotPasswordTurnstileError = () => {
-            setStatus(statusNode, submitButton, false);
+            setStatus(statusNode, submitButton, STATUS_ERROR);
         };
+
+        const syncInterval = window.setInterval(() => {
+            syncStatusFromToken(form, statusNode, submitButton);
+        }, 400);
+        window.addEventListener('beforeunload', () => {
+            window.clearInterval(syncInterval);
+        }, { once: true });
 
         form.addEventListener('submit', (event) => {
             if (readTurnstileToken(form)) {
                 return;
             }
-            setStatus(statusNode, submitButton, false);
+            setStatus(statusNode, submitButton, STATUS_WAITING);
             event.preventDefault();
         });
     }

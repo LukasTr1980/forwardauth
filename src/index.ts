@@ -56,6 +56,7 @@ interface LoginBody {
 
 interface ForgotPasswordBody {
     email?: string;
+    'cf-turnstile-response'?: string;
 }
 
 interface ResetPasswordQuery {
@@ -256,6 +257,11 @@ const PASSWORD_MAX_LENGTH = getEnvAsNumber('PASSWORD_MAX_LENGTH', 256);
 const PASSWORD_RESET_RESPONSE_FLOOR_MS = getEnvAsNumber('PASSWORD_RESET_RESPONSE_FLOOR_MS', 250);
 const PASSWORD_RESET_URL_BASE = process.env.PASSWORD_RESET_URL_BASE ?? `${AUTH_ORIGIN}/auth/reset-password`;
 const PASSWORD_RESET_URL_BASE_PARSED = parseAbsoluteHttpUrl(PASSWORD_RESET_URL_BASE, 'PASSWORD_RESET_URL_BASE');
+const TURNSTILE_FORGOT_PASSWORD_ENABLED =
+    process.env.TURNSTILE_FORGOT_PASSWORD_ENABLED === '1' || process.env.TURNSTILE_FORGOT_PASSWORD_ENABLED === 'true';
+const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY?.trim() ?? '';
+const TURNSTILE_VERIFY_TIMEOUT_MS = Math.max(500, getEnvAsNumber('TURNSTILE_VERIFY_TIMEOUT_MS', 3000));
+const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER === 'resend' ? 'resend' : 'noop';
 const EMAIL_FROM = process.env.EMAIL_FROM ?? `${BRAND_AUTH_LABEL} <no-reply@${LOGIN_REDIRECT_PARSED.hostname}>`;
 const EMAIL_REQUEST_TIMEOUT_MS = getEnvAsNumber('EMAIL_REQUEST_TIMEOUT_MS', 10000);
@@ -322,10 +328,24 @@ const IDENTITY_DATABASE_URL = getEnvSecret('IDENTITY_DATABASE_URL', 'IDENTITY_DA
 const RESEND_API_KEY = getEnvSecret('RESEND_API_KEY', 'RESEND_API_KEY_FILE');
 const PASSWORD_RESET_TOKEN_SECRET =
     getEnvSecret('PASSWORD_RESET_TOKEN_SECRET', 'PASSWORD_RESET_TOKEN_SECRET_FILE') ?? secretEnv;
+const TURNSTILE_SECRET_KEY =
+    getEnvSecret('TURNSTILE_SECRET_KEY', 'TURNSTILE_SECRET_KEY_FILE')?.trim() ?? '';
 
 if (USER_STORE_BACKEND === 'postgres' && !IDENTITY_DATABASE_URL) {
     logger.error('[config] FATAL: USER_STORE_BACKEND=postgres requires IDENTITY_DATABASE_URL or IDENTITY_DATABASE_URL_FILE.');
     process.exit(1);
+}
+
+if (TURNSTILE_FORGOT_PASSWORD_ENABLED) {
+    if (!TURNSTILE_SITE_KEY) {
+        logger.error('[config] FATAL: TURNSTILE_FORGOT_PASSWORD_ENABLED requires TURNSTILE_SITE_KEY.');
+        process.exit(1);
+    }
+
+    if (!TURNSTILE_SECRET_KEY) {
+        logger.error('[config] FATAL: TURNSTILE_FORGOT_PASSWORD_ENABLED requires TURNSTILE_SECRET_KEY or TURNSTILE_SECRET_KEY_FILE.');
+        process.exit(1);
+    }
 }
 
 // Redis (or optional in-memory fallback for local development) for rate limiting and sessions
@@ -783,6 +803,9 @@ function logStartupConfig(): void {
         `[config] password-reset/email: enabled=${PASSWORD_RESET_ENABLED} tokenTtlS=${PASSWORD_RESET_TOKEN_TTL_S} mailQuota=${PASSWORD_RESET_MAIL_MAX}/${PASSWORD_RESET_MAIL_WINDOW_S}s resetUrlBase=${PASSWORD_RESET_URL_BASE_PARSED.toString()} passwordMinLength=${PASSWORD_MIN_LENGTH} passwordMaxLength=${PASSWORD_MAX_LENGTH} emailProvider=${EMAIL_PROVIDER} emailFrom=${EMAIL_FROM}`
     );
     logger.info(
+        `[config] turnstile: forgotPasswordEnabled=${TURNSTILE_FORGOT_PASSWORD_ENABLED} siteKey=${TURNSTILE_SITE_KEY ? 'set' : 'unset'} secret=${TURNSTILE_SECRET_KEY ? 'set' : 'unset'} verifyTimeoutMs=${TURNSTILE_VERIFY_TIMEOUT_MS}`
+    );
+    logger.info(
         `[config] passkey-rate-limits: auth=${PASSKEY_LOGIN_LIMITER_MAX}/${PASSKEY_LOGIN_LIMITER_WINDOW_S}s register=${PASSKEY_REGISTER_LIMITER_MAX}/${PASSKEY_REGISTER_LIMITER_WINDOW_S}s credentials=${PASSKEY_CREDENTIALS_LIMITER_MAX}/${PASSKEY_CREDENTIALS_LIMITER_WINDOW_S}s`
     );
     logger.info(
@@ -837,6 +860,9 @@ const formActionSources = ["'self'", AUTH_ORIGIN, ROOT_DOMAIN, DOMAIN_WILDCARD].
 app.use(helmet.contentSecurityPolicy({
     directives: {
         defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", 'https://challenges.cloudflare.com'],
+        connectSrc: ["'self'", 'https://challenges.cloudflare.com'],
+        frameSrc: ["'self'", 'https://challenges.cloudflare.com'],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         frameAncestors: ["'none'"],
@@ -1407,6 +1433,16 @@ function buildPasswordResetUnavailableBody(): string {
 }
 
 function buildForgotPasswordFormBody(messageHtml = ''): string {
+    const turnstileHtml = TURNSTILE_FORGOT_PASSWORD_ENABLED
+        ? `
+            <div class="turnstile-wrap">
+                <div class="cf-turnstile" data-sitekey="${he.encode(TURNSTILE_SITE_KEY)}" data-action="forgot_password"></div>
+                <p class="meta">Sicherheitspruefung erforderlich.</p>
+            </div>
+            <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+        `
+        : '';
+
     return `
         <section class="content-stack">
             <h1>Passwort vergessen?</h1>
@@ -1417,6 +1453,7 @@ function buildForgotPasswordFormBody(messageHtml = ''): string {
                     <label for="forgot-email">E-Mail-Adresse</label>
                     <input id="forgot-email" name="email" type="email" placeholder="name@example.com" required autocomplete="email" />
                 </div>
+                ${turnstileHtml}
                 <button type="submit">Reset-Link anfordern</button>
             </form>
             <p class="meta"><a class="inline-link" href="/auth">Zurück zur Anmeldung</a></p>
@@ -2695,6 +2732,74 @@ async function consumePasswordResetMailQuota(userId: string): Promise<{ allowed:
     };
 }
 
+interface TurnstileVerifyResult {
+    ok: boolean;
+    reason: string;
+}
+
+async function verifyForgotPasswordTurnstile(req: Request): Promise<TurnstileVerifyResult> {
+    if (!TURNSTILE_FORGOT_PASSWORD_ENABLED) {
+        return { ok: true, reason: 'disabled' };
+    }
+
+    const bodyRecord = isObjectRecord(req.body) ? req.body : {};
+    const token = getRequiredTrimmedString(bodyRecord['cf-turnstile-response']);
+    if (!token) {
+        return { ok: false, reason: 'missing-token' };
+    }
+
+    const body = new URLSearchParams();
+    body.set('secret', TURNSTILE_SECRET_KEY);
+    body.set('response', token);
+    if (req.ip && req.ip !== 'unknown') {
+        body.set('remoteip', req.ip);
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TURNSTILE_VERIFY_TIMEOUT_MS);
+    try {
+        const response = await fetch(TURNSTILE_VERIFY_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: body.toString(),
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            logger.warn(`[turnstile] forgot-password verify failed with HTTP ${response.status}`);
+            return { ok: false, reason: 'verify-http-error' };
+        }
+
+        const payload = await response.json() as unknown;
+        if (!isObjectRecord(payload) || payload.success !== true) {
+            return { ok: false, reason: 'verify-declined' };
+        }
+
+        if (typeof payload.action === 'string' && payload.action !== 'forgot_password') {
+            logger.warn(`[turnstile] forgot-password verify rejected due to action mismatch (${payload.action})`);
+            return { ok: false, reason: 'action-mismatch' };
+        }
+
+        const expectedHost = LOGIN_REDIRECT_PARSED.hostname.toLowerCase();
+        if (typeof payload.hostname === 'string' && payload.hostname.toLowerCase() !== expectedHost) {
+            logger.warn(`[turnstile] forgot-password verify rejected due to hostname mismatch (${payload.hostname})`);
+            return { ok: false, reason: 'hostname-mismatch' };
+        }
+
+        return { ok: true, reason: 'ok' };
+    } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            logger.warn(`[turnstile] forgot-password verify timed out after ${TURNSTILE_VERIFY_TIMEOUT_MS}ms`);
+            return { ok: false, reason: 'verify-timeout' };
+        }
+        logger.warn('[turnstile] forgot-password verify failed due to request error.', error);
+        return { ok: false, reason: 'verify-request-error' };
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
 const forgotPasswordPageHandler: RequestHandler = (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
@@ -2722,6 +2827,14 @@ const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, Forg
             logger.warn(`[password-reset] Cross-site forgot-password blocked from IP: ${sourceIp} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
             const body = '<div class="alert alert--error">Ungültige Anfrageherkunft.</div>';
             res.status(403).send(getPageHTML('Zugriff verweigert', body));
+            return;
+        }
+
+        const turnstileResult = await verifyForgotPasswordTurnstile(req as Request);
+        if (!turnstileResult.ok) {
+            logger.warn(`[password-reset] Turnstile verification failed from IP ${sourceIp} (reason=${turnstileResult.reason})`);
+            const message = '<div class="alert alert--error">Sicherheitspruefung fehlgeschlagen. Bitte erneut versuchen.</div>';
+            res.status(400).send(getPageHTML('Passwort vergessen', buildForgotPasswordFormBody(message)));
             return;
         }
 

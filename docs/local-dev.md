@@ -46,3 +46,18 @@ Hinweis:
 - In Production ist `INMEMORY_FALLBACK` blockiert.
 - Der Password-Reset-Flow ist nur im Postgres-Identity-Modus aktiv (`USER_STORE_BACKEND=postgres`).
 - Für lokale Mail-Tests ohne Versand kann `EMAIL_PROVIDER=noop` verwendet werden (Default).
+
+## Optional: Turnstile fuer `forgot-password`
+
+Wenn du Bot-Schutz im lokalen oder Staging-Test pruefen willst:
+
+- `TURNSTILE_FORGOT_PASSWORD_ENABLED=1`
+- `TURNSTILE_SITE_KEY=<site-key>`
+- `TURNSTILE_SECRET_KEY_FILE=/run/secrets/turnstile_secret_key` (empfohlen)
+- alternativ nur lokal: `TURNSTILE_SECRET_KEY=<secret-key>`
+- optional: `TURNSTILE_VERIFY_TIMEOUT_MS=3000`
+
+Hinweis:
+
+- In Docker Swarm sollte das Secret ueber `TURNSTILE_SECRET_KEY_FILE` kommen, nicht als Klartext-Env.
+- Bei aktivem Feature wird `POST /auth/forgot-password` ohne gueltiges Turnstile-Token mit `400` abgewiesen.

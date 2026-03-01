@@ -1072,7 +1072,7 @@ function getLoginFlowCookieOptions(maxAge: number): cookie.SerializeOptions {
         httpOnly: true,
         secure: true,
         sameSite: 'lax',
-        path: '/auth',
+        path: '/',
         maxAge,
     };
     if (DOMAIN) {

@@ -18,11 +18,9 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "dev:inmemory": "JWT_SECRET=dev-secret NODE_ENV=development INMEMORY_FALLBACK=1 USER_FILE=./users.dev.json PASSKEY_ENABLED=1 PASSKEY_RP_ID=localhost PASSKEY_RP_NAME=ForwardAuth-Dev PASSKEY_ORIGIN=http://localhost:3000 tsx watch src/index.ts",
+    "dev:postgres": "JWT_SECRET=dev-secret NODE_ENV=development INMEMORY_FALLBACK=1 IDENTITY_DATABASE_URL=postgres://postgres:postgres@localhost:5432/forwardauth PASSKEY_ENABLED=1 PASSKEY_RP_ID=localhost PASSKEY_RP_NAME=ForwardAuth-Dev PASSKEY_ORIGIN=http://localhost:3000 tsx watch src/index.ts",
     "test": "echo \"no tests yet\"",
     "lint": "eslint . --cache",
-    "generate-hash": "tsx src/generate-hash.ts",
-    "migrate-users": "tsx src/migrate-users-json-to-identity-db.ts",
     "rel:patch": "npm version patch --no-git-tag-version",
     "rel:minor": "npm version minor --no-git-tag-version",
     "rel:major": "npm version major --no-git-tag-version"

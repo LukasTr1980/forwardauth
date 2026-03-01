@@ -17,7 +17,6 @@ export interface UserStore {
     getUserById(id: string): Promise<UserAuthRecord | null>;
     updatePasswordHashById?(id: string, passwordHash: string): Promise<boolean>;
     loadInitial(): Promise<void>;
-    reload?(): Promise<void>;
 }
 
 interface PostgresUserRow {

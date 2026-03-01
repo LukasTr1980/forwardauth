@@ -16,7 +16,7 @@ This guide is designed to be handed directly to service owners for implementatio
 
 ### Breaking Changes
 
-1. `X-Forwarded-User` changes from **email address** to **UUID** (when ForwardAuth runs in PostgreSQL identity mode)
+1. `X-Forwarded-User` changes from **email address** to **UUID**
 2. JWT `sub` changes from **email address** to **UUID**
 3. Session identity in ForwardAuth backend is now **UUID-based** (internal, but relevant if you inspect tokens)
 
@@ -34,10 +34,8 @@ This guide is designed to be handed directly to service owners for implementatio
 
 ### Deployment Mode Caveat (Important)
 
-- The UUID-based identity contract in this document applies when ForwardAuth is running with:
-  - `USER_STORE_BACKEND=postgres`
-- In `USER_STORE_BACKEND=json` compatibility mode:
-  - `X-Forwarded-User` remains the normalized email (legacy behavior)
+- ForwardAuth uses PostgreSQL identity only.
+- `users.json` compatibility mode has been removed.
 
 ## Change Scope
 
@@ -58,7 +56,7 @@ This migration does **not** directly affect downstreams that:
 
 ### Response Headers from `/verify`
 
-For **successful authenticated `/verify` responses (HTTP 200)** in PostgreSQL identity mode (`USER_STORE_BACKEND=postgres`), ForwardAuth will set:
+For **successful authenticated `/verify` responses (HTTP 200)**, ForwardAuth will set:
 
 - `X-Forwarded-User`: `<uuid>`
 - `X-Forwarded-User-Email`: `<normalized-email>`
@@ -387,7 +385,6 @@ Before distributing this document, add:
 
 Relevant implementation changes in this repository:
 
-- `src/index.ts` (user store backend switch, JWT/header identity changes, `/auth/status`)
+- `src/index.ts` (JWT/header identity changes, `/auth/status`)
 - `src/postgres-user-store.ts` (PostgreSQL user lookup)
 - `migrations/001_identity_users.sql` (identity schema)
-- `src/migrate-users-json-to-identity-db.ts` (one-time JSON import)

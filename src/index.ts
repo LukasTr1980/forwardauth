@@ -16,18 +16,14 @@ import {
     type WebAuthnCredential,
 } from '@simplewebauthn/server';
 import argon2 from 'argon2';
-import fs from 'fs/promises';
-import { watchFile, readFileSync } from 'node:fs';
-import path from 'path';
+import { readFileSync } from 'node:fs';
 import helmet from 'helmet';
 import he from 'he';
 import validator from 'validator';
 import { randomUUID } from 'node:crypto';
 import {
     PostgresUserStore,
-    type HostAccessMode,
     type UserAuthRecord,
-    type UserStore,
 } from './postgres-user-store.js';
 import { createEmailService } from './email-service.js';
 import {
@@ -35,13 +31,6 @@ import {
     type PasswordResetStore,
 } from './postgres-password-reset-store.js';
 // CSRF cookie removed; we rely on Origin/Referer checks for POST /auth
-
-interface User {
-    hash: string;
-    allowedHosts?: string[];
-    isAdult?: boolean;
-    isAdmin?: boolean;
-}
 
 interface LoginQuery {
     redirect_uri?: string;
@@ -214,9 +203,6 @@ if (!secretEnv) {
 }
 
 const JWT_SECRET = new TextEncoder().encode(secretEnv);
-// Resolve users.json relative to the working directory (ESM-safe and robust across tsx/tsc/Docker)
-const USER_FILE = process.env.USER_FILE ?? path.resolve(process.cwd(), 'users.json');
-const USER_STORE_BACKEND = process.env.USER_STORE_BACKEND === 'postgres' ? 'postgres' : 'json';
 const IDENTITY_DB_POOL_MAX = getEnvAsNumber('IDENTITY_DB_POOL_MAX', 10);
 const IDENTITY_DB_SSL = process.env.IDENTITY_DB_SSL === '1' || process.env.IDENTITY_DB_SSL === 'true';
 const PORT = getEnvAsNumber('PORT', 3000);
@@ -243,10 +229,9 @@ const AUTH_ORIGIN = LOGIN_REDIRECT_PARSED.origin;
 const BRAND_NAME = DOMAIN ?? LOGIN_REDIRECT_PARSED.hostname;
 const BRAND_AUTH_LABEL = process.env.BRAND_AUTH_LABEL ?? `${BRAND_NAME} Auth`;
 const JUST_LOGGED_GRACE_MS = getEnvAsNumber('JUST_LOGGED_GRACE_MS', 10) * 1000;
-const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS', 5000);
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
 const ADULT_PATH_PREFIXES = parseCsvList(process.env.ADULT_PATH_PREFIXES).map(normalizePathPrefix).filter(Boolean);
-const PASSWORD_RESET_ENABLED = USER_STORE_BACKEND === 'postgres';
+const PASSWORD_RESET_ENABLED = true;
 const PASSWORD_RESET_TOKEN_TTL_S = getEnvAsNumber('PASSWORD_RESET_TOKEN_TTL_S', 6 * 60 * 60);
 const PASSWORD_RESET_MAIL_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_MAIL_WINDOW_S', 30 * 60);
 const PASSWORD_RESET_MAIL_MAX = getEnvAsNumber('PASSWORD_RESET_MAIL_MAX', 5);
@@ -333,8 +318,19 @@ const PASSWORD_RESET_TOKEN_SECRET =
 const TURNSTILE_SECRET_KEY =
     getEnvSecret('TURNSTILE_SECRET_KEY', 'TURNSTILE_SECRET_KEY_FILE')?.trim() ?? '';
 
-if (USER_STORE_BACKEND === 'postgres' && !IDENTITY_DATABASE_URL) {
-    logger.error('[config] FATAL: USER_STORE_BACKEND=postgres requires IDENTITY_DATABASE_URL or IDENTITY_DATABASE_URL_FILE.');
+const LEGACY_USER_STORE_ENV_KEYS = ['USER_STORE_BACKEND', 'USER_FILE', 'USER_FILE_WATCH_INTERVAL_MS'] as const;
+const configuredLegacyUserStoreEnvKeys = LEGACY_USER_STORE_ENV_KEYS
+    .filter((key) => Object.prototype.hasOwnProperty.call(process.env, key));
+if (configuredLegacyUserStoreEnvKeys.length > 0) {
+    logger.error(
+        `[config] FATAL: Legacy users.json env var(s) are no longer supported: ${configuredLegacyUserStoreEnvKeys.join(', ')}. `
+        + 'Remove them and configure PostgreSQL identity via IDENTITY_DATABASE_URL or IDENTITY_DATABASE_URL_FILE.'
+    );
+    process.exit(1);
+}
+
+if (!IDENTITY_DATABASE_URL) {
+    logger.error('[config] FATAL: IDENTITY_DATABASE_URL or IDENTITY_DATABASE_URL_FILE is required.');
     process.exit(1);
 }
 
@@ -797,7 +793,7 @@ function logStartupConfig(): void {
         `[config] auth: domain=${DOMAIN ?? '(unset)'} cookieName=${COOKIE_NAME} jwtIssuer=${JWT_ISSUER} loginRedirectUrl=${LOGIN_REDIRECT_URL} cookieMaxAgeS=${COOKIE_MAX_AGE_S} maxSessionsPerUser=${MAX_SESSIONS_PER_USER}`
     );
     logger.info(
-        `[config] users: backend=${USER_STORE_BACKEND} file=${USER_FILE} watchIntervalMs=${USER_FILE_WATCH_INTERVAL_MS} identityDb=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} identityDbSsl=${IDENTITY_DB_SSL ? 'on' : 'off'} identityDbPoolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'}, resendApiKey=${RESEND_API_KEY ? 'set' : 'unset'})`
+        `[config] identity-db: url=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} ssl=${IDENTITY_DB_SSL ? 'on' : 'off'} poolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'}, resendApiKey=${RESEND_API_KEY ? 'set' : 'unset'})`
     );
     logger.info(
         `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s logout=${LOGOUT_LIMITER_MAX}/${LOGOUT_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s forgotPassword=${PASSWORD_RESET_LIMITER_MAX}/${PASSWORD_RESET_LIMITER_WINDOW_S}s resetPassword=${PASSWORD_RESET_CONFIRM_LIMITER_MAX}/${PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S}s`
@@ -897,167 +893,6 @@ let passkeyCredentialsLimiter: RequestHandler;
 
 // Toast page removed
 
-let users: Record<string, User> = {};
-
-function getHostAccessModeFromJsonUser(user: User): HostAccessMode {
-    if (user.allowedHosts === undefined) return 'all';
-    if (user.allowedHosts.length === 0) return 'deny_all';
-    return 'allow_list';
-}
-
-function toUserAuthRecordFromJson(email: string, user: User): UserAuthRecord {
-    const hostAccessMode = getHostAccessModeFromJsonUser(user);
-    return {
-        id: email, // json backend compatibility: historic subject/session key is the normalized email
-        email,
-        passwordHash: user.hash,
-        isAdmin: user.isAdmin === true,
-        isAdult: user.isAdult === true,
-        hostAccessMode,
-        allowedHosts: user.allowedHosts ? [...user.allowedHosts] : [],
-    };
-}
-
-class JsonUserStore implements UserStore {
-    async loadInitial(): Promise<void> {
-        await loadUsers();
-    }
-
-    async reload(): Promise<void> {
-        await loadUsers({ fatal: false });
-    }
-
-    getUserByEmail(email: string): Promise<UserAuthRecord | null> {
-        const user = users[email];
-        if (!user) return Promise.resolve(null);
-        return Promise.resolve(toUserAuthRecordFromJson(email, user));
-    }
-
-    getUserById(id: string): Promise<UserAuthRecord | null> {
-        const normalized = normalizeEmailIdentifier(id);
-        const user = users[normalized];
-        if (!user) return Promise.resolve(null);
-        return Promise.resolve(toUserAuthRecordFromJson(normalized, user));
-    }
-}
-
-function isStringArray(value: unknown): value is string[] {
-    return Array.isArray(value) && value.every((item) => typeof item === 'string');
-}
-
-function isRecordOfUser(data: unknown): data is Record<string, User> {
-    return (
-        typeof data === 'object' &&
-        data !== null &&
-        Object.values(data).every(
-            (u) => typeof (u as User).hash === 'string' &&
-                (
-                    (u as User).allowedHosts === undefined ||
-                    isStringArray((u as User).allowedHosts)
-                ) &&
-                (
-                    (u as User).isAdult === undefined ||
-                    typeof (u as User).isAdult === 'boolean'
-                ) &&
-                (
-                    (u as User).isAdmin === undefined ||
-                    typeof (u as User).isAdmin === 'boolean'
-                )
-        )
-    );
-}
-
-function extractTopLevelUserKeys(jsonContent: string): string[] {
-    const keys: string[] = [];
-    let inString = false;
-    let escaped = false;
-    let depth = 0;
-    let current = '';
-    let lastString: string | null = null;
-
-    for (const char of jsonContent) {
-        if (inString) {
-            if (escaped) {
-                current += char;
-                escaped = false;
-                continue;
-            }
-
-            if (char === '\\') {
-                current += char;
-                escaped = true;
-                continue;
-            }
-
-            if (char === '"') {
-                inString = false;
-                lastString = current;
-                current = '';
-                continue;
-            }
-
-            current += char;
-            continue;
-        }
-
-        if (char === '"') {
-            inString = true;
-            current = '';
-            continue;
-        }
-
-        if (char === '{') {
-            depth++;
-            continue;
-        }
-
-        if (char === '}') {
-            depth = Math.max(0, depth - 1);
-            lastString = null;
-            continue;
-        }
-
-        if (char === ':' && depth === 1 && lastString !== null) {
-            try {
-                const decoded = JSON.parse(`"${lastString}"`) as string;
-                keys.push(decoded);
-            } catch {
-                keys.push(lastString);
-            }
-            lastString = null;
-            continue;
-        }
-
-        if (char === ',' || char.trim() !== '') {
-            lastString = null;
-        }
-    }
-
-    return keys;
-}
-
-function findDuplicateEmails(jsonContent: string): string[] {
-    const userKeys = extractTopLevelUserKeys(jsonContent);
-    const seen = new Set<string>();
-    const duplicates = new Set<string>();
-
-    for (const key of userKeys) {
-        const normalized = normalizeEmailIdentifier(key);
-        if (seen.has(normalized)) {
-            duplicates.add(normalized);
-        } else {
-            seen.add(normalized);
-        }
-    }
-
-    return Array.from(duplicates);
-}
-
-function findNonNormalizedEmails(jsonContent: string): string[] {
-    const userKeys = extractTopLevelUserKeys(jsonContent);
-    return userKeys.filter((key) => normalizeEmailIdentifier(key) !== key);
-}
-
 function normalizeHost(host: string): string {
     const primaryHost = host.split(',')[0] ?? '';
     const withoutPort = primaryHost.split(':')[0] ?? '';
@@ -1127,64 +962,11 @@ function isAdultPath(uri: string): boolean {
     return ADULT_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
-async function loadUsers(options: { fatal?: boolean } = { fatal: true }) {
-    const { fatal = true } = options;
-    try {
-        const rawContent = await fs.readFile(USER_FILE, 'utf-8');
-        const duplicateEmails = findDuplicateEmails(rawContent);
-        const nonNormalizedEmails = findNonNormalizedEmails(rawContent);
-        const raw: unknown = JSON.parse(rawContent);
-
-        if (!isRecordOfUser(raw)) {
-            throw new Error('Invalid users.json structure');
-        }
-
-        if (duplicateEmails.length > 0) {
-            const message = `Duplicate emails detected: ${duplicateEmails.join(', ')}`;
-            if (fatal) {
-                logger.error(`[users] FATAL: ${message}`);
-                process.exit(1);
-            } else {
-                logger.warn(`[users] ${message}. Reload skipped; keeping previous users.`);
-                return;
-            }
-        }
-
-        if (nonNormalizedEmails.length > 0) {
-            const message = `users.json keys must be lowercase/trimmed emails. Invalid keys: ${nonNormalizedEmails.join(', ')}`;
-            if (fatal) {
-                logger.error(`[users] FATAL: ${message}`);
-                process.exit(1);
-            } else {
-                logger.warn(`[users] ${message}. Reload skipped; keeping previous users.`);
-                return;
-            }
-        }
-
-        users = raw;
-        logger.info(`[users] Loaded ${Object.keys(users).length} users from ${USER_FILE}`);
-    } catch (error) {
-        if (fatal) {
-            logger.error(`[users] FATAL: Could not load or parse user file from "${USER_FILE}".`, error);
-            process.exit(1);
-        } else {
-            logger.warn(`[users] Reloading users failed; keeping previous users. (${(error as Error).message})`);
-        }
-    }
-}
-
-function createUserStore(): UserStore {
-    if (USER_STORE_BACKEND === 'postgres') {
-        return new PostgresUserStore({
-            databaseUrl: IDENTITY_DATABASE_URL ?? '',
-            maxPoolSize: IDENTITY_DB_POOL_MAX,
-            ssl: IDENTITY_DB_SSL,
-        });
-    }
-    return new JsonUserStore();
-}
-
-const userStore: UserStore = createUserStore();
+const userStore = new PostgresUserStore({
+    databaseUrl: IDENTITY_DATABASE_URL ?? '',
+    maxPoolSize: IDENTITY_DB_POOL_MAX,
+    ssl: IDENTITY_DB_SSL,
+});
 const passwordResetTokenStore: PasswordResetStore | null = PASSWORD_RESET_ENABLED
     ? new PostgresPasswordResetStore({
         databaseUrl: IDENTITY_DATABASE_URL ?? '',
@@ -1213,7 +995,7 @@ const emailService = createConfiguredEmailService();
 
 async function initializeUserStore(): Promise<void> {
     await userStore.loadInitial();
-    logger.info(`[users] User store initialized (${USER_STORE_BACKEND})`);
+    logger.info('[users] User store initialized (postgres)');
 }
 
 async function initializePasswordResetStore(): Promise<void> {
@@ -2160,7 +1942,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
 
         const requestedUri = req.header('X-Forwarded-Uri') ?? req.originalUrl ?? '/';
         const adultContentRequested = isAdultPath(requestedUri);
-        // Trust primary flag from users.json; allow a signed token claim as additive truthy signal
+        // Trust primary user-store flag; allow a signed token claim as additive truthy signal.
         const userIsAdult = userRecord.isAdult === true || payload.isAdult === true;
 
         if (adultContentRequested && !userIsAdult) {
@@ -3621,23 +3403,9 @@ void (async () => {
         );
 
         // Removed /still-logged route
-
-        if (USER_STORE_BACKEND === 'json') {
-            // Poll for changes in users.json and reload on modifications (json backend only)
-            watchFile(USER_FILE, { interval: USER_FILE_WATCH_INTERVAL_MS }, (curr, prev) => {
-                if (curr.mtimeMs !== prev.mtimeMs) {
-                    logger.debug(`[users] Change detected (mtime). Reloading users from ${USER_FILE}...`);
-                    void userStore.reload?.();
-                }
-            });
-
-            process.on('SIGHUP', () => {
-                logger.debug('[users] SIGHUP received. Reloading users...');
-                void userStore.reload?.();
-            });
-        }
     } catch (error) {
-        logger.warn('[users] Failed to initialize watch/polling for users file.', error);
+        logger.error('[startup] FATAL: Failed to initialize runtime components.', error);
+        process.exit(1);
     }
 
     app.listen(PORT, () => {

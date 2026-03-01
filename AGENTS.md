@@ -1,16 +1,16 @@
 # Repository Guidelines
 
 ## Project Structure & Modules
-- `src/`: TypeScript source. Entry is `src/index.ts`; helper CLI `src/generate-hash.ts`.
+- `src/`: TypeScript source. Entry is `src/index.ts`; Postgres stores in `src/postgres-user-store.ts` and `src/postgres-password-reset-store.ts`.
 - `public/`: Static assets served by Express (styles).
-- `users.json`: Credentials store (Argon2 hashes). Default path is repo root; override with `USER_FILE`.
+- `migrations/`: SQL schema migrations for identity users and password-reset tokens.
 - `.github/`, `.pre-commit-config.yaml`, `eslint.config.mjs`: CI and linting configuration.
 
 ## Build, Run, and Dev
 - `npm run dev`: Start local server with hot‐reload via `tsx`.
+- `npm run dev:postgres`: Start local dev server with Postgres identity defaults and in-memory Redis fallback.
 - `npm start`: Run the server (TypeScript executed via `tsx`).
 - `npm run lint`: Type‑checked ESLint over TS/JS.
-- `npm run generate-hash`: Interactive Argon2 hash generator for `users.json`.
 - Docker: `docker build -t forwardauth .` then run with a secret for `JWT_SECRET`; entrypoint reads `/run/secrets/jwt_secret`.
 
 ## Coding Style & Conventions
@@ -37,11 +37,11 @@
 
 ## Security & Configuration
 - This GitHub repository is public. Treat all tracked files, PRs, issues, and comments as publicly visible.
-- Required env: `JWT_SECRET` (must be set); recommended: `DOMAIN`, optional: `COOKIE_NAME`, `USER_FILE`, rate‑limit windows and maxima.
+- Required env: `JWT_SECRET` and `IDENTITY_DATABASE_URL` (or `IDENTITY_DATABASE_URL_FILE`); recommended: `DOMAIN`, optional: `COOKIE_NAME`, rate‑limit windows and maxima.
 - Never commit secrets or sensitive data. This includes real passwords, API keys, tokens, private hostnames/internal IPs, customer/user PII, and production config values. `gitleaks` runs via pre‑commit and CI; fix or mark intentional.
 - Keep all examples sanitized with placeholders (e.g., `<DOMAIN>`, `<PASSWORD>`, `<TOKEN>`), especially in docs and deployment manifests.
 - Use HTTPS and set proper `X-Forwarded-*` headers when running behind a proxy.
-- `users.json` format: `{ "username": { "hash": "<argon2id hash>" } }`. Generate with `npm run generate-hash`.
+- Legacy `users.json` configuration is removed. Do not set `USER_STORE_BACKEND`, `USER_FILE`, or `USER_FILE_WATCH_INTERVAL_MS`.
 
 ## Docker Swarm (Sanitized)
 - Masked examples only. Replace placeholders outside this repo. Do not commit real domains, host paths, passwords, or resolver names.
@@ -59,7 +59,7 @@ services:
       COOKIE_NAME: "<COOKIE_NAME>"
       JWT_ISSUER: "<JWT_ISSUER>"
       DOMAIN: "<DOMAIN>"
-      USER_FILE: "/app/data/users.json"
+      IDENTITY_DATABASE_URL_FILE: "/run/secrets/identity_database_url"
       COOKIE_MAX_AGE_S: "<SECONDS>"
       LOGIN_LIMITER_WINDOW_S: "<SECONDS>"
       LOGIN_REDIRECT_URL: "https://<AUTH_HOST>/auth"
@@ -85,8 +85,6 @@ services:
       traefik.http.middlewares.forwardauth.forwardauth.address: "http://forwardauth:3000/verify"
       traefik.http.middlewares.forwardauth.forwardauth.trustForwardHeader: "true"
       traefik.http.middlewares.forwardauth.forwardauth.authResponseHeaders: "X-Forwarded-User"
-    volumes:
-      - /HOST/PATH/forwardauth/users.json:/app/data/users.json:ro
     networks:
       overlay-a:
         aliases: [forwardauth_server_container]
@@ -94,6 +92,7 @@ services:
         aliases: [forwardauth_server_container]
     secrets:
       - jwt_secret
+      - identity_database_url
       - redis_password   # forwardauth only; Redis itself reads via its conf file
 
   redis:
@@ -122,12 +121,15 @@ volumes:
 secrets:
   jwt_secret:
     external: true
+  identity_database_url:
+    external: true
   redis_password:
     external: true
 ```
 
 Notes
 - forwardauth reads `JWT_SECRET` from the `jwt_secret` secret (`/run/secrets/jwt_secret`).
+- Identity DB URL should be provided via `IDENTITY_DATABASE_URL_FILE` (e.g. `/run/secrets/identity_database_url`).
 - Redis password: Redis may load its password from its mounted `redis.conf` (e.g., `requirepass ...`). forwardauth must read the same password via `REDIS_PASSWORD_FILE` pointing to `/run/secrets/redis_password`.
 - Choose one Redis config path: either `REDIS_URL` or `REDIS_HOST`+`REDIS_PORT`. For TLS, use `rediss://` in `REDIS_URL` or set `REDIS_TLS=1`.
-- Env keys used by the app (values masked here): `COOKIE_NAME`, `JWT_ISSUER`, `DOMAIN`, `USER_FILE`, `COOKIE_MAX_AGE_S`, `LOGIN_LIMITER_WINDOW_S`, `LOGIN_LIMITER_MAX`, `LOGIN_REDIRECT_URL`, `TOAST_INTERVAL_S`, `REDIS_URL`/`REDIS_HOST`/`REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD_FILE`, `REDIS_TLS`.
+- Env keys used by the app (values masked here): `COOKIE_NAME`, `JWT_ISSUER`, `DOMAIN`, `IDENTITY_DATABASE_URL`/`IDENTITY_DATABASE_URL_FILE`, `IDENTITY_DB_SSL`, `IDENTITY_DB_POOL_MAX`, `COOKIE_MAX_AGE_S`, `LOGIN_LIMITER_WINDOW_S`, `LOGIN_LIMITER_MAX`, `LOGIN_REDIRECT_URL`, `REDIS_URL`/`REDIS_HOST`/`REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD_FILE`, `REDIS_TLS`.

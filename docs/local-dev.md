@@ -1,26 +1,51 @@
-# Local Dev (ohne Redis)
+# Local Dev (Postgres Identity, ohne Redis)
 
-Für reines lokales UI-Testing kannst du den In-Memory-Fallback nutzen:
+ForwardAuth nutzt lokal und in Produktion nur noch den Postgres-Identity-Store.
 
-Zuerst eine lokale `users.dev.json` anlegen (wird nicht versioniert):
+## 1) Postgres starten
 
 ```bash
-cat > users.dev.json <<'EOF'
-{
-    "admin@example.com": {
-        "hash": "<ARGON2_HASH_FROM_NPM_RUN_GENERATE_HASH>",
-        "isAdmin": true
-    }
-}
-EOF
+docker run --name forwardauth-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=forwardauth \
+  -p 5432:5432 \
+  -d postgres:16
 ```
 
-Den Hash kannst du lokal mit `npm run generate-hash` erzeugen.
-
-Dann starten:
+## 2) Schema migrieren
 
 ```bash
-npm run dev:inmemory
+psql "postgres://postgres:postgres@localhost:5432/forwardauth" -f migrations/001_identity_users.sql
+psql "postgres://postgres:postgres@localhost:5432/forwardauth" -f migrations/002_password_reset_tokens.sql
+```
+
+## 3) Test-User anlegen
+
+Argon2-Hash lokal erzeugen:
+
+```bash
+node -e 'import("argon2").then(async ({ default: argon2 }) => { console.log(await argon2.hash("dev-password")); process.exit(0); })'
+```
+
+Danach mit dem erzeugten Hash einen Benutzer schreiben:
+
+```bash
+psql "postgres://postgres:postgres@localhost:5432/forwardauth" <<'SQL'
+INSERT INTO users (email, password_hash, is_admin, is_adult, host_access_mode)
+VALUES ('admin@example.com', '<ARGON2_HASH>', true, true, 'all')
+ON CONFLICT (email) DO UPDATE SET
+  password_hash = EXCLUDED.password_hash,
+  is_admin = EXCLUDED.is_admin,
+  is_adult = EXCLUDED.is_adult,
+  host_access_mode = EXCLUDED.host_access_mode;
+SQL
+```
+
+## 4) Service starten
+
+```bash
+npm run dev:postgres
 ```
 
 Der Befehl setzt automatisch:
@@ -28,24 +53,23 @@ Der Befehl setzt automatisch:
 - `NODE_ENV=development`
 - `INMEMORY_FALLBACK=1`
 - `JWT_SECRET=dev-secret`
-- `USER_FILE=./users.dev.json`
+- `IDENTITY_DATABASE_URL=postgres://postgres:postgres@localhost:5432/forwardauth`
 - `PASSKEY_ENABLED=1`
 - `PASSKEY_RP_ID=localhost`
 - `PASSKEY_RP_NAME=ForwardAuth-Dev`
 - `PASSKEY_ORIGIN=http://localhost:3000`
 
-Test-Login aus `users.dev.json`:
+Test-Login:
 
 - E-Mail: `admin@example.com`
-- Passwort: das Passwort, das du beim Hash-Generieren verwendet hast
+- Passwort: `dev-password` (oder dein eigenes Passwort aus Schritt 3)
 
-Hinweis:
+Hinweise:
 
-- In-Memory-Daten gehen beim Neustart verloren (gewollt für Dev).
-- Passkey-UI ist in diesem Dev-Start standardmäßig aktiv.
-- In Production ist `INMEMORY_FALLBACK` blockiert.
-- Der Password-Reset-Flow ist nur im Postgres-Identity-Modus aktiv (`USER_STORE_BACKEND=postgres`).
-- Für lokale Mail-Tests ohne Versand kann `EMAIL_PROVIDER=noop` verwendet werden (Default).
+- In-Memory-Redis-Fallback ist nur fuer Development gedacht und in Production blockiert.
+- Password-Reset ist im Postgres-Setup verfuegbar.
+- Legacy-Variablen (`USER_STORE_BACKEND`, `USER_FILE`, `USER_FILE_WATCH_INTERVAL_MS`) fuehren jetzt zu einem Startup-Fehler.
+- Fuer lokale Mail-Tests ohne Versand kann `EMAIL_PROVIDER=noop` verwendet werden (Default).
 
 ## Optional: Turnstile fuer `forgot-password`
 

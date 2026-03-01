@@ -827,10 +827,17 @@ function isDocumentRequest(req: Request): boolean {
     return acceptsHtml(req);
 }
 
-function getHeaderString(req: Request, name: string): string {
+function getHeaderString(req: Pick<Request, 'headers'>, name: string): string {
     const value = req.headers[name.toLowerCase()];
     if (Array.isArray(value)) return value[0] ?? '';
     return typeof value === 'string' ? value : '';
+}
+
+function isAndroidAppWebViewRequest(req: Pick<Request, 'headers'>): boolean {
+    const userAgent = getHeaderString(req, 'user-agent');
+    if (!userAgent) return false;
+    if (!/android/i.test(userAgent)) return false;
+    return userAgent.includes('ChartsCXPlayer/');
 }
 
 function isAllowedAuthPost(req: Request): boolean {
@@ -2209,7 +2216,7 @@ const verifyHandler: RequestHandler = async (req, res) => {
         const loginUrl = new URL(LOGIN_REDIRECT_URL);
         loginUrl.searchParams.set('redirect_uri', originalUrl);
         if (isDocumentRequest(req)) {
-            res.redirect(loginUrl.toString());
+            res.redirect(303, loginUrl.toString());
         } else {
             res.status(401).set('Cache-Control', 'no-store').end('Unauthorized');
         }
@@ -3094,7 +3101,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                                 const setupPasskeyUrl = new URL(`${AUTH_ORIGIN}/auth`);
                                 setupPasskeyUrl.searchParams.set('redirect_uri', validatedDestinationUri);
                                 setupPasskeyUrl.searchParams.set('setup_passkey', '1');
-                                res.redirect(setupPasskeyUrl.toString());
+                                res.redirect(303, setupPasskeyUrl.toString());
                                 return;
                             }
                         } catch (error) {
@@ -3102,7 +3109,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                         }
                     }
 
-                    res.redirect(validatedDestinationUri);
+                    res.redirect(303, validatedDestinationUri);
                     return;
                 }
             } catch (error) {
@@ -3153,6 +3160,13 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
         }
 
         const promptPasskeySetup = PASSKEY_ENABLED && setupPasskeyRequested && !hasPasskey;
+        const hasExplicitRedirectUri = typeof rawRedirectUri === 'string' && rawRedirectUri.trim() !== '';
+        const fromAndroidAppWebView = isAndroidAppWebViewRequest(req);
+        if (req.method === 'GET' && fromAndroidAppWebView && hasExplicitRedirectUri && !promptPasskeySetup) {
+            res.redirect(303, validatedDestinationUri);
+            return;
+        }
+
         const loggedInBody = buildLoggedInBody(safeDestinationUri, {
             signedInUser: getJwtEmailClaim(payload) ?? currentUser.email,
             setupPasskeyPrompt: promptPasskeySetup,

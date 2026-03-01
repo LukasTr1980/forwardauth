@@ -200,6 +200,24 @@
         }
     }
 
+    function isAndroidAppWebView() {
+        const userAgent = typeof navigator.userAgent === 'string' ? navigator.userAgent : '';
+        if (!/Android/i.test(userAgent)) {
+            return false;
+        }
+        const hasBridge = window && window.ChartsCXPlayer != null
+            && (typeof window.ChartsCXPlayer === 'object' || typeof window.ChartsCXPlayer === 'function');
+        return userAgent.includes('ChartsCXPlayer/') || hasBridge;
+    }
+
+    function navigateToTarget(target) {
+        if (isAndroidAppWebView()) {
+            window.location.replace(target);
+            return;
+        }
+        window.location.assign(target);
+    }
+
     function normalizeEmailInput(value) {
         if (typeof value !== 'string') return '';
         const normalized = value.trim().toLowerCase();
@@ -262,7 +280,7 @@
                 });
 
                 const target = sanitizeRedirectTarget(typeof verifyResponse.redirectTo === 'string' ? verifyResponse.redirectTo : '/', allowedDomain);
-                window.location.assign(target);
+                navigateToTarget(target);
             } catch (error) {
                 setMessage(message, error instanceof Error ? error.message : 'Passkey-Login fehlgeschlagen.', true);
             } finally {
@@ -380,7 +398,7 @@
                     setMessage(message, 'Passkey erfolgreich registriert. Weiterleitung...', false);
                     const safeRedirect = sanitizeRedirectTarget(redirectTo, allowedDomain);
                     window.setTimeout(() => {
-                        window.location.assign(safeRedirect);
+                        navigateToTarget(safeRedirect);
                     }, 350);
                 }
             } catch (error) {

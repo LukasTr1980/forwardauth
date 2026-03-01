@@ -244,7 +244,9 @@ const USER_FILE_WATCH_INTERVAL_MS = getEnvAsNumber('USER_FILE_WATCH_INTERVAL_MS'
 const MAX_SESSIONS_PER_USER = getEnvAsNumber('MAX_SESSIONS_PER_USER', 3);
 const ADULT_PATH_PREFIXES = parseCsvList(process.env.ADULT_PATH_PREFIXES).map(normalizePathPrefix).filter(Boolean);
 const PASSWORD_RESET_ENABLED = USER_STORE_BACKEND === 'postgres';
-const PASSWORD_RESET_TOKEN_TTL_S = getEnvAsNumber('PASSWORD_RESET_TOKEN_TTL_S', 30 * 60);
+const PASSWORD_RESET_TOKEN_TTL_S = getEnvAsNumber('PASSWORD_RESET_TOKEN_TTL_S', 6 * 60 * 60);
+const PASSWORD_RESET_MAIL_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_MAIL_WINDOW_S', 30 * 60);
+const PASSWORD_RESET_MAIL_MAX = getEnvAsNumber('PASSWORD_RESET_MAIL_MAX', 5);
 const PASSWORD_RESET_LIMITER_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_LIMITER_WINDOW_S', 15 * 60);
 const PASSWORD_RESET_LIMITER_MAX = getEnvAsNumber('PASSWORD_RESET_LIMITER_MAX', 10);
 const PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S', 15 * 60);
@@ -318,6 +320,8 @@ function getEnvSecret(key: string, fileKey: string): string | undefined {
 
 const IDENTITY_DATABASE_URL = getEnvSecret('IDENTITY_DATABASE_URL', 'IDENTITY_DATABASE_URL_FILE');
 const RESEND_API_KEY = getEnvSecret('RESEND_API_KEY', 'RESEND_API_KEY_FILE');
+const PASSWORD_RESET_TOKEN_SECRET =
+    getEnvSecret('PASSWORD_RESET_TOKEN_SECRET', 'PASSWORD_RESET_TOKEN_SECRET_FILE') ?? secretEnv;
 
 if (USER_STORE_BACKEND === 'postgres' && !IDENTITY_DATABASE_URL) {
     logger.error('[config] FATAL: USER_STORE_BACKEND=postgres requires IDENTITY_DATABASE_URL or IDENTITY_DATABASE_URL_FILE.');
@@ -371,6 +375,8 @@ interface RedisClientLike {
     set(key: string, value: string, options?: RedisSetOptionsLike): Promise<string | null>;
     getDel(key: string): Promise<string | null>;
     del(key: string): Promise<number>;
+    incr(key: string): Promise<number>;
+    expire(key: string, seconds: number): Promise<number>;
     mGet(keys: string[]): Promise<(string | null)[]>;
     hSet(key: string, field: string, value: string): Promise<number>;
     hGetAll(key: string): Promise<Record<string, string>>;
@@ -508,6 +514,27 @@ class InMemoryRedisClient implements RedisClientLike {
     del(key: string): Promise<number> {
         this.clearExpiredKey(key);
         return Promise.resolve(this.deleteKeyInternal(key));
+    }
+
+    incr(key: string): Promise<number> {
+        this.clearExpiredKey(key);
+        const currentRaw = this.strings.get(key);
+        const current = currentRaw ? Number.parseInt(currentRaw, 10) : 0;
+        const next = Number.isFinite(current) ? current + 1 : 1;
+        this.ensureType(key, 'string');
+        this.strings.set(key, String(next));
+        return Promise.resolve(next);
+    }
+
+    expire(key: string, seconds: number): Promise<number> {
+        if (!Number.isFinite(seconds) || seconds <= 0) {
+            return Promise.resolve(0);
+        }
+        if (!this.keyExists(key)) {
+            return Promise.resolve(0);
+        }
+        this.expiries.set(key, Date.now() + seconds * 1000);
+        return Promise.resolve(1);
     }
 
     mGet(keys: string[]): Promise<(string | null)[]> {
@@ -753,7 +780,7 @@ function logStartupConfig(): void {
         `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s forgotPassword=${PASSWORD_RESET_LIMITER_MAX}/${PASSWORD_RESET_LIMITER_WINDOW_S}s resetPassword=${PASSWORD_RESET_CONFIRM_LIMITER_MAX}/${PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S}s`
     );
     logger.info(
-        `[config] password-reset/email: enabled=${PASSWORD_RESET_ENABLED} tokenTtlS=${PASSWORD_RESET_TOKEN_TTL_S} resetUrlBase=${PASSWORD_RESET_URL_BASE_PARSED.toString()} passwordMinLength=${PASSWORD_MIN_LENGTH} passwordMaxLength=${PASSWORD_MAX_LENGTH} emailProvider=${EMAIL_PROVIDER} emailFrom=${EMAIL_FROM}`
+        `[config] password-reset/email: enabled=${PASSWORD_RESET_ENABLED} tokenTtlS=${PASSWORD_RESET_TOKEN_TTL_S} mailQuota=${PASSWORD_RESET_MAIL_MAX}/${PASSWORD_RESET_MAIL_WINDOW_S}s resetUrlBase=${PASSWORD_RESET_URL_BASE_PARSED.toString()} passwordMinLength=${PASSWORD_MIN_LENGTH} passwordMaxLength=${PASSWORD_MAX_LENGTH} emailProvider=${EMAIL_PROVIDER} emailFrom=${EMAIL_FROM}`
     );
     logger.info(
         `[config] passkey-rate-limits: auth=${PASSKEY_LOGIN_LIMITER_MAX}/${PASSKEY_LOGIN_LIMITER_WINDOW_S}s register=${PASSKEY_REGISTER_LIMITER_MAX}/${PASSKEY_REGISTER_LIMITER_WINDOW_S}s credentials=${PASSKEY_CREDENTIALS_LIMITER_MAX}/${PASSKEY_CREDENTIALS_LIMITER_WINDOW_S}s`
@@ -1124,6 +1151,7 @@ const userStore: UserStore = createUserStore();
 const passwordResetTokenStore: PasswordResetStore | null = PASSWORD_RESET_ENABLED
     ? new PostgresPasswordResetStore({
         databaseUrl: IDENTITY_DATABASE_URL ?? '',
+        tokenSecret: PASSWORD_RESET_TOKEN_SECRET,
         maxPoolSize: IDENTITY_DB_POOL_MAX,
         ssl: IDENTITY_DB_SSL,
     })
@@ -2651,6 +2679,22 @@ function buildPasswordResetLink(token: string): string {
     return url.toString();
 }
 
+function passwordResetMailCounterKey(userId: string): string {
+    return `pwdreset:mail:${userId}`;
+}
+
+async function consumePasswordResetMailQuota(userId: string): Promise<{ allowed: boolean; count: number }> {
+    const key = passwordResetMailCounterKey(userId);
+    const count = await redisClient.incr(key);
+    if (count === 1) {
+        await redisClient.expire(key, PASSWORD_RESET_MAIL_WINDOW_S);
+    }
+    return {
+        allowed: count <= PASSWORD_RESET_MAIL_MAX,
+        count,
+    };
+}
+
 const forgotPasswordPageHandler: RequestHandler = (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
@@ -2691,15 +2735,24 @@ const forgotPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, Forg
                     requestedIp: sourceIp,
                     requestedUserAgent: getHeaderString(req as Request, 'user-agent') || 'unknown',
                 });
-                const resetUrl = buildPasswordResetLink(issued.token);
-                const expiresInMinutes = Math.max(1, Math.floor(PASSWORD_RESET_TOKEN_TTL_S / 60));
-                await emailService.sendPasswordResetEmail({
-                    to: userRecord.email,
-                    resetUrl,
-                    expiresInMinutes,
-                    brandLabel: BRAND_AUTH_LABEL,
-                });
-                logger.info(`[password-reset] Reset email queued for user "${userRecord.id}" from IP ${sourceIp}`);
+                const quota = await consumePasswordResetMailQuota(userRecord.id);
+                if (!quota.allowed) {
+                    logger.warn(
+                        `[password-reset] Mail quota exceeded for user "${userRecord.id}" from IP ${sourceIp} (limit=${PASSWORD_RESET_MAIL_MAX}/${PASSWORD_RESET_MAIL_WINDOW_S}s count=${quota.count})`
+                    );
+                } else {
+                    const resetUrl = buildPasswordResetLink(issued.token);
+                    const expiresInMinutes = Math.max(1, Math.ceil((issued.expiresAt.getTime() - Date.now()) / 60000));
+                    await emailService.sendPasswordResetEmail({
+                        to: userRecord.email,
+                        resetUrl,
+                        expiresInMinutes,
+                        brandLabel: BRAND_AUTH_LABEL,
+                    });
+                    logger.info(
+                        `[password-reset] Reset email queued for user "${userRecord.id}" from IP ${sourceIp} (reusedToken=${issued.reused ? 'yes' : 'no'} count=${quota.count}/${PASSWORD_RESET_MAIL_MAX})`
+                    );
+                }
             }
         }
     } catch (error) {

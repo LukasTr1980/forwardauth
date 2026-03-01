@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 
 export interface PasswordResetIssueInput {
@@ -11,11 +11,13 @@ export interface PasswordResetIssueInput {
 export interface PasswordResetIssueResult {
     token: string;
     expiresAt: Date;
+    reused: boolean;
 }
 
 interface PasswordResetTokenRow {
     id: string;
     user_id: string;
+    token_hash: string;
     expires_at: Date | string;
     consumed_at: Date | string | null;
 }
@@ -28,6 +30,7 @@ export interface PasswordResetStore {
 
 export interface PostgresPasswordResetStoreOptions {
     databaseUrl: string;
+    tokenSecret: string;
     maxPoolSize?: number;
     ssl?: boolean;
 }
@@ -43,6 +46,7 @@ function parseTimestamp(value: Date | string): number {
 
 export class PostgresPasswordResetStore implements PasswordResetStore {
     private readonly pool: Pool;
+    private readonly tokenSecret: string;
 
     constructor(options: PostgresPasswordResetStoreOptions) {
         this.pool = new Pool({
@@ -50,6 +54,7 @@ export class PostgresPasswordResetStore implements PasswordResetStore {
             max: options.maxPoolSize,
             ...(options.ssl ? { ssl: { rejectUnauthorized: false } } : {}),
         });
+        this.tokenSecret = options.tokenSecret;
     }
 
     async loadInitial(): Promise<void> {
@@ -71,8 +76,51 @@ export class PostgresPasswordResetStore implements PasswordResetStore {
         }
     }
 
+    private buildReusableToken(tokenId: string): string {
+        const idPart = tokenId.replace(/-/g, '');
+        const mac = createHmac('sha256', this.tokenSecret)
+            .update(tokenId)
+            .digest('base64url');
+        return `${idPart}${mac}`;
+    }
+
     async issueTokenForUser(input: PasswordResetIssueInput): Promise<PasswordResetIssueResult> {
         return this.withTransaction(async (client) => {
+            const existingResult = await client.query<PasswordResetTokenRow>(`
+                SELECT
+                    id,
+                    user_id,
+                    token_hash,
+                    expires_at,
+                    consumed_at
+                FROM password_reset_tokens
+                WHERE user_id = $1 AND consumed_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+            `, [input.userId]);
+
+            const existing = existingResult.rows[0];
+            if (existing) {
+                const expiresAtMs = parseTimestamp(existing.expires_at);
+                const notExpired = Number.isFinite(expiresAtMs) && expiresAtMs > Date.now();
+                if (notExpired) {
+                    const token = this.buildReusableToken(existing.id);
+                    if (hashToken(token) === existing.token_hash) {
+                        return {
+                            token,
+                            expiresAt: new Date(expiresAtMs),
+                            reused: true,
+                        };
+                    }
+                }
+
+                await client.query(
+                    'UPDATE password_reset_tokens SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL',
+                    [existing.id],
+                );
+            }
+
             await client.query(
                 'UPDATE password_reset_tokens SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL',
                 [input.userId],
@@ -81,22 +129,25 @@ export class PostgresPasswordResetStore implements PasswordResetStore {
             const expiresAt = new Date(Date.now() + input.ttlSeconds * 1000);
 
             for (let attempt = 0; attempt < 5; attempt++) {
-                const token = randomBytes(32).toString('base64url');
+                const tokenId = randomUUID();
+                const token = this.buildReusableToken(tokenId);
                 const tokenDigest = hashToken(token);
 
                 try {
                     await client.query(
                         `
                         INSERT INTO password_reset_tokens (
+                            id,
                             user_id,
                             token_hash,
                             expires_at,
                             requested_ip,
                             requested_user_agent
                         )
-                        VALUES ($1, $2, $3, $4, $5)
+                        VALUES ($1, $2, $3, $4, $5, $6)
                         `,
                         [
+                            tokenId,
                             input.userId,
                             tokenDigest,
                             expiresAt,
@@ -104,7 +155,7 @@ export class PostgresPasswordResetStore implements PasswordResetStore {
                             input.requestedUserAgent ?? null,
                         ],
                     );
-                    return { token, expiresAt };
+                    return { token, expiresAt, reused: false };
                 } catch (error) {
                     const code = (error as { code?: string }).code;
                     if (code === '23505') {

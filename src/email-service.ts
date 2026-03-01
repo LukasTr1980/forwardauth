@@ -49,24 +49,35 @@ function escapeHtml(value: string): string {
         .replace(/'/g, '&#39;');
 }
 
+function getBrandForPasswordResetEmail(label: string): string {
+    const trimmed = label.trim();
+    if (!trimmed) return 'Ihr Konto';
+    const withoutAuthSuffix = trimmed.replace(/\s+auth$/i, '').trim();
+    return withoutAuthSuffix || trimmed;
+}
+
 function buildPasswordResetSubject(input: PasswordResetEmailInput): string {
-    return `Passwort zurücksetzen für ${input.brandLabel}`;
+    const brand = getBrandForPasswordResetEmail(input.brandLabel);
+    return `Passwort zurücksetzen für ${brand}`;
 }
 
 function buildPasswordResetText(input: PasswordResetEmailInput): string {
+    const brand = getBrandForPasswordResetEmail(input.brandLabel);
     return [
-        `Sie haben ein neues Passwort für ${input.brandLabel} angefordert.`,
+        `Es wurde eine Anfrage zum Zurücksetzen des Passworts für ${brand} gestellt.`,
         '',
         `Link zum Zurücksetzen (gültig für ${input.expiresInMinutes} Minuten):`,
         input.resetUrl,
         '',
-        'Falls Sie diese Anfrage nicht gestellt haben, können Sie diese E-Mail ignorieren.',
+        'WICHTIGER SICHERHEITSHINWEIS:',
+        'Wenn Sie diese Anfrage nicht selbst gestellt haben, ignorieren Sie diese E-Mail.',
+        'Ihr Passwort bleibt unverändert, solange Sie den Link nicht verwenden.',
     ].join('\n');
 }
 
 function buildPasswordResetHtml(input: PasswordResetEmailInput): string {
     const escapedUrl = escapeHtml(input.resetUrl);
-    const escapedLabel = escapeHtml(input.brandLabel);
+    const escapedLabel = escapeHtml(getBrandForPasswordResetEmail(input.brandLabel));
     return `
 <!doctype html>
 <html lang="de">
@@ -76,10 +87,12 @@ function buildPasswordResetHtml(input: PasswordResetEmailInput): string {
     <title>Passwort zurücksetzen</title>
 </head>
 <body>
-    <p>Sie haben ein neues Passwort für <strong>${escapedLabel}</strong> angefordert.</p>
+    <p>Es wurde eine Anfrage zum Zurücksetzen des Passworts für <strong>${escapedLabel}</strong> gestellt.</p>
     <p>Der Link ist für <strong>${input.expiresInMinutes} Minuten</strong> gültig:</p>
     <p><a href="${escapedUrl}">Passwort zurücksetzen</a></p>
-    <p>Falls Sie diese Anfrage nicht gestellt haben, können Sie diese E-Mail ignorieren.</p>
+    <p><strong>Wichtiger Sicherheitshinweis:</strong></p>
+    <p><strong>Wenn Sie diese Anfrage nicht selbst gestellt haben, ignorieren Sie diese E-Mail.</strong></p>
+    <p>Ihr Passwort bleibt unverändert, solange Sie den Link nicht verwenden.</p>
 </body>
 </html>
 `;

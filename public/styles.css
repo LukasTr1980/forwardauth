@@ -439,6 +439,25 @@ button:disabled {
     color: var(--color-accent);
 }
 
+.inline-link--forgot {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.3rem 0.62rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-border) 70%);
+    background: color-mix(in srgb, var(--color-accent) 10%, var(--color-surface) 90%);
+    text-decoration: none;
+    font-size: 0.9rem;
+    font-weight: 620;
+}
+
+.inline-link--forgot:hover {
+    color: var(--color-accent);
+    border-color: color-mix(in srgb, var(--color-accent) 52%, var(--color-border) 48%);
+    background: color-mix(in srgb, var(--color-accent) 16%, var(--color-surface) 84%);
+    text-decoration: none;
+}
+
 a:not(.button):not(.subnav-link):not(.brand) {
     color: var(--color-accent-strong);
 }

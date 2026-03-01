@@ -1309,7 +1309,7 @@ function buildLoginFormBody(safeDestinationUri: string, headlineHtml: string): s
     const forgotPasswordHtml = PASSWORD_RESET_ENABLED
         ? `
             <p class="meta">
-                <a class="inline-link" href="/auth/forgot-password">Passwort vergessen?</a>
+                <a class="inline-link inline-link--forgot" href="/auth/forgot-password">Passwort vergessen?</a>
             </p>
         `
         : '';

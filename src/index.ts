@@ -65,6 +65,12 @@ interface ResetPasswordBody {
     password_confirm?: string;
 }
 
+interface ChangePasswordBody {
+    current_password?: string;
+    password?: string;
+    password_confirm?: string;
+}
+
 interface PasskeyAuthOptionsBody {
     email?: string;
     state?: string;
@@ -255,6 +261,8 @@ const PASSWORD_RESET_LIMITER_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_LIMITER_W
 const PASSWORD_RESET_LIMITER_MAX = getEnvAsNumber('PASSWORD_RESET_LIMITER_MAX', 10);
 const PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S = getEnvAsNumber('PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S', 15 * 60);
 const PASSWORD_RESET_CONFIRM_LIMITER_MAX = getEnvAsNumber('PASSWORD_RESET_CONFIRM_LIMITER_MAX', 10);
+const CHANGE_PASSWORD_LIMITER_WINDOW_S = getEnvAsNumber('CHANGE_PASSWORD_LIMITER_WINDOW_S', 15 * 60);
+const CHANGE_PASSWORD_LIMITER_MAX = getEnvAsNumber('CHANGE_PASSWORD_LIMITER_MAX', 10);
 const PASSWORD_MIN_LENGTH = getEnvAsNumber('PASSWORD_MIN_LENGTH', 12);
 const PASSWORD_MAX_LENGTH = getEnvAsNumber('PASSWORD_MAX_LENGTH', 256);
 const PASSWORD_RESET_RESPONSE_FLOOR_MS = getEnvAsNumber('PASSWORD_RESET_RESPONSE_FLOOR_MS', 250);
@@ -751,6 +759,7 @@ let logoutStore: RateLimitStore | undefined;
 let adminLastSeenStore: RateLimitStore | undefined;
 let forgotPasswordStore: RateLimitStore | undefined;
 let resetPasswordConfirmStore: RateLimitStore | undefined;
+let changePasswordStore: RateLimitStore | undefined;
 let passkeyAuthStore: RateLimitStore | undefined;
 let passkeyRegisterStore: RateLimitStore | undefined;
 let passkeyCredentialsStore: RateLimitStore | undefined;
@@ -812,7 +821,7 @@ function logStartupConfig(): void {
         `[config] identity-db: url=${sanitizeDatabaseUrl(IDENTITY_DATABASE_URL) ?? '(unset)'} ssl=${IDENTITY_DB_SSL ? 'on' : 'off'} poolMax=${IDENTITY_DB_POOL_MAX} secrets(jwt=${secretEnv ? 'set' : 'unset'}, redisPassword=${REDIS_PASSWORD ? 'set' : 'unset'}, redisUsername=${REDIS_USERNAME ? 'set' : 'unset'}, resendApiKey=${RESEND_API_KEY ? 'set' : 'unset'})`
     );
     logger.info(
-        `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s logout=${LOGOUT_LIMITER_MAX}/${LOGOUT_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s forgotPassword=${PASSWORD_RESET_LIMITER_MAX}/${PASSWORD_RESET_LIMITER_WINDOW_S}s resetPassword=${PASSWORD_RESET_CONFIRM_LIMITER_MAX}/${PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S}s`
+        `[config] rate-limits: login=${LOGIN_LIMITER_MAX}/${LOGIN_LIMITER_WINDOW_S}s verify=${VERIFY_LIMITER_MAX}/${VERIFY_LIMITER_WINDOW_S}s authPage=${AUTH_PAGE_LIMITER_MAX}/${AUTH_PAGE_LIMITER_WINDOW_S}s logout=${LOGOUT_LIMITER_MAX}/${LOGOUT_LIMITER_WINDOW_S}s adminLastSeen=${ADMIN_LAST_SEEN_LIMITER_MAX}/${ADMIN_LAST_SEEN_LIMITER_WINDOW_S}s forgotPassword=${PASSWORD_RESET_LIMITER_MAX}/${PASSWORD_RESET_LIMITER_WINDOW_S}s resetPassword=${PASSWORD_RESET_CONFIRM_LIMITER_MAX}/${PASSWORD_RESET_CONFIRM_LIMITER_WINDOW_S}s changePassword=${CHANGE_PASSWORD_LIMITER_MAX}/${CHANGE_PASSWORD_LIMITER_WINDOW_S}s`
     );
     logger.info(
         `[config] password-reset/email: enabled=${PASSWORD_RESET_ENABLED} tokenTtlS=${PASSWORD_RESET_TOKEN_TTL_S} mailQuota=${PASSWORD_RESET_MAIL_MAX}/${PASSWORD_RESET_MAIL_WINDOW_S}s resetUrlBase=${PASSWORD_RESET_URL_BASE_PARSED.toString()} passwordMinLength=${PASSWORD_MIN_LENGTH} passwordMaxLength=${PASSWORD_MAX_LENGTH} emailProvider=${EMAIL_PROVIDER} emailFrom=${EMAIL_FROM}`
@@ -896,6 +905,7 @@ let logoutLimiter: RequestHandler;
 let adminLastSeenLimiter: RequestHandler;
 let forgotPasswordLimiter: RequestHandler;
 let resetPasswordConfirmLimiter: RequestHandler;
+let changePasswordLimiter: RequestHandler;
 let passkeyAuthLimiter: RequestHandler;
 let passkeyRegisterLimiter: RequestHandler;
 let passkeyCredentialsLimiter: RequestHandler;
@@ -1266,6 +1276,18 @@ interface LoggedInBodyOptions {
     autoRedirectAfterPasskeySetup?: boolean;
 }
 
+function buildChangePasswordShortcut(): string {
+    return `
+        <section class="panel panel--soft" aria-labelledby="change-password-shortcut-heading">
+            <h2 id="change-password-shortcut-heading">Passwort ändern</h2>
+            <p class="meta">Öffnen Sie die Passwort-Seite, um Ihr aktuelles Passwort zu bestätigen und ein neues zu setzen.</p>
+            <div class="action-row">
+                <a class="button button--primary" href="/auth/change-password">Passwort ändern</a>
+            </div>
+        </section>
+    `;
+}
+
 function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOptions = {}): string {
     const signedInUser = typeof options.signedInUser === 'string' ? options.signedInUser : '';
     const signedInHeadingHtml = signedInUser
@@ -1286,6 +1308,7 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
         : '';
     const setupPrompt = options.setupPasskeyPrompt === true;
     const autoRedirectAfterSetup = options.autoRedirectAfterPasskeySetup === true;
+    const changePasswordShortcut = buildChangePasswordShortcut();
     const setupPromptHtml = setupPrompt ? `
         <div class="setup-callout panel">
             <h2>Bitte jetzt Passkey einrichten</h2>
@@ -1318,6 +1341,7 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
                 <h1>Fast geschafft</h1>
                 ${signedInUserHtml}
                 ${setupPromptHtml}
+                ${changePasswordShortcut}
                 ${passkeySection}
                 <p class="meta login-actions">
                     Falls es gerade nicht möglich ist:
@@ -1337,6 +1361,7 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
             <div class="action-row">
                 <a class="button button--primary" href="${safeDestinationUri}">Zur geschützten Seite</a>
             </div>
+            ${changePasswordShortcut}
             ${passkeySection}
             <div class="login-actions login-actions--bottom">
                 <a class="button button--ghost" href="/logout">Abmelden</a>
@@ -1410,6 +1435,32 @@ function buildForgotPasswordSubmittedBody(loginState?: string): string {
             <div class="action-row">
                 <a class="button button--primary" href="${backToAuthHref}">Zur Anmeldung</a>
             </div>
+        </section>
+    `;
+}
+
+function buildChangePasswordFormBody(messageHtml = ''): string {
+    return `
+        <section class="content-stack">
+            <h1>Passwort ändern</h1>
+            <p>Bitte bestätigen Sie Ihr aktuelles Passwort und vergeben Sie ein neues.</p>
+            ${messageHtml}
+            <form class="form-stack" method="post" action="${AUTH_ORIGIN}/auth/change-password">
+                <div class="field">
+                    <label for="change-current-password">Aktuelles Passwort</label>
+                    <input id="change-current-password" name="current_password" type="password" required autocomplete="current-password" />
+                </div>
+                <div class="field">
+                    <label for="change-password">Neues Passwort</label>
+                    <input id="change-password" name="password" type="password" required autocomplete="new-password" />
+                </div>
+                <div class="field">
+                    <label for="change-password-confirm">Neues Passwort bestätigen</label>
+                    <input id="change-password-confirm" name="password_confirm" type="password" required autocomplete="new-password" />
+                </div>
+                <button type="submit">Passwort speichern</button>
+            </form>
+            <p class="meta"><a class="inline-link" href="/auth">Zurück zu Auth</a></p>
         </section>
     `;
 }
@@ -2227,6 +2278,13 @@ function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseRequiredCurrentPassword(value: unknown): string {
+    if (typeof value !== 'string' || value.length === 0) {
+        throw new Error('Bitte geben Sie Ihr aktuelles Passwort ein.');
+    }
+    return value;
+}
+
 function parseRequiredNewPassword(value: unknown): string {
     if (typeof value !== 'string') {
         throw new Error('Bitte geben Sie ein neues Passwort ein.');
@@ -2433,7 +2491,7 @@ const passkeyAuthOptionsHandler: RequestHandler<ParamsDictionary, unknown, Passk
         return;
     }
 
-    const loginState = parseLoginState(req.body?.state);
+    const loginState = parseLoginState(req.body?.state) ?? undefined;
     const flowCookies = cookie.parse(req.headers.cookie ?? '');
     const loginFlowId = parseLoginFlowId(flowCookies[LOGIN_FLOW_COOKIE_NAME]);
     if (req.body?.state && !loginState) {
@@ -2977,6 +3035,104 @@ const resetPasswordSubmitHandler: RequestHandler<ParamsDictionary, string, Reset
     }
 };
 
+const changePasswordPageHandler: RequestHandler = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const auth = await authenticateSession(req as Request);
+    if (!auth) {
+        res.redirect(303, '/auth');
+        return;
+    }
+
+    res.status(200).send(getPageHTML('Passwort ändern', buildChangePasswordFormBody()));
+};
+
+const changePasswordSubmitHandler: RequestHandler<ParamsDictionary, string, ChangePasswordBody> = async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+
+    const auth = await authenticateSession(req as Request);
+    if (!auth) {
+        logger.warn(`[password-change] Unauthorized change-password attempt from IP: ${req.ip ?? 'unknown'}`);
+        res.redirect(303, '/auth');
+        return;
+    }
+
+    if (!isAllowedAuthPost(req as Request)) {
+        logger.warn(`[password-change] Cross-site change-password blocked from IP: ${req.ip ?? 'unknown'} (origin=${req.headers.origin ?? ''}, referer=${req.headers.referer ?? ''})`);
+        const body = '<div class="alert alert--error">Ungültige Anfrageherkunft.</div>';
+        res.status(403).send(getPageHTML('Zugriff verweigert', body));
+        return;
+    }
+
+    const renderFormError = (statusCode: number, message: string): void => {
+        const messageHtml = `<div class="alert alert--error">${he.encode(message)}</div>`;
+        res.status(statusCode).send(getPageHTML('Passwort ändern', buildChangePasswordFormBody(messageHtml)));
+    };
+
+    let currentPassword: string;
+    try {
+        currentPassword = parseRequiredCurrentPassword(req.body?.current_password);
+    } catch (error) {
+        renderFormError(400, (error as Error).message);
+        return;
+    }
+
+    let newPassword: string;
+    try {
+        newPassword = parseRequiredNewPassword(req.body?.password);
+    } catch (error) {
+        renderFormError(400, (error as Error).message);
+        return;
+    }
+
+    const passwordConfirm = typeof req.body?.password_confirm === 'string' ? req.body.password_confirm : '';
+    if (newPassword !== passwordConfirm) {
+        renderFormError(400, 'Die Passwörter stimmen nicht überein.');
+        return;
+    }
+
+    try {
+        const currentPasswordMatches = await argon2.verify(auth.user.passwordHash, currentPassword);
+        if (!currentPasswordMatches) {
+            logger.warn(`[password-change] Current password mismatch for user "${auth.user.id}" from IP ${req.ip ?? 'unknown'}`);
+            renderFormError(400, 'Das aktuelle Passwort ist nicht korrekt.');
+            return;
+        }
+
+        const isSamePassword = await argon2.verify(auth.user.passwordHash, newPassword);
+        if (isSamePassword) {
+            renderFormError(400, 'Das neue Passwort muss sich vom aktuellen unterscheiden.');
+            return;
+        }
+
+        const passwordHash = await argon2.hash(newPassword);
+        const updated = await userStore.updatePasswordHashById(auth.user.id, passwordHash);
+        if (!updated) {
+            throw new Error('Password hash update returned no rows.');
+        }
+
+        const revokedSessions = await sessionStore.removeAllSessions(auth.user.id);
+        const sessionCookieOptions: cookie.SerializeOptions = {
+            maxAge: 0,
+            domain: DOMAIN,
+            httpOnly: true,
+            secure: true,
+            sameSite: 'strict',
+            path: '/',
+        };
+        if (!DOMAIN) delete sessionCookieOptions.domain;
+        res.setHeader('Set-Cookie', [
+            cookie.serialize(COOKIE_NAME, '', sessionCookieOptions),
+        ]);
+
+        logger.info(`[password-change] Password changed for user "${auth.user.id}" (revokedSessions=${revokedSessions})`);
+        res.status(200).send(getPageHTML('Passwort aktualisiert', buildResetPasswordSuccessBody()));
+    } catch (error) {
+        logger.error(`[password-change] Failed to change password for user "${auth.user.id}"`, error);
+        renderFormError(500, 'Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.');
+    }
+};
+
 const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>, string, LoginBody, LoginQuery> = async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
 
@@ -3513,6 +3669,7 @@ void (async () => {
             adminLastSeenStore = new RedisStore({ sendCommand, prefix: 'rl:admin-lastseen:' });
             forgotPasswordStore = new RedisStore({ sendCommand, prefix: 'rl:forgot-password:' });
             resetPasswordConfirmStore = new RedisStore({ sendCommand, prefix: 'rl:reset-password:' });
+            changePasswordStore = new RedisStore({ sendCommand, prefix: 'rl:change-password:' });
             passkeyAuthStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-auth:' });
             passkeyRegisterStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-register:' });
             passkeyCredentialsStore = new RedisStore({ sendCommand, prefix: 'rl:passkey-credentials:' });
@@ -3575,6 +3732,14 @@ void (async () => {
             message: 'Zu viele Passwort-Reset-Bestätigungen von dieser IP. Bitte versuchen Sie es später erneut.',
             ...(resetPasswordConfirmStore ? { store: resetPasswordConfirmStore } : {}),
         });
+        changePasswordLimiter = rateLimit({
+            windowMs: CHANGE_PASSWORD_LIMITER_WINDOW_S * 1000,
+            limit: CHANGE_PASSWORD_LIMITER_MAX,
+            standardHeaders: true,
+            legacyHeaders: false,
+            message: 'Zu viele Passwortänderungs-Anfragen von dieser IP. Bitte versuchen Sie es später erneut.',
+            ...(changePasswordStore ? { store: changePasswordStore } : {}),
+        });
         passkeyAuthLimiter = rateLimit({
             windowMs: PASSKEY_LOGIN_LIMITER_WINDOW_S * 1000,
             limit: PASSKEY_LOGIN_LIMITER_MAX,
@@ -3614,6 +3779,8 @@ void (async () => {
         app.post('/auth/forgot-password', forgotPasswordLimiter, forgotPasswordSubmitHandler);
         app.get('/auth/reset-password', authPageLimiter, resetPasswordPageHandler);
         app.post('/auth/reset-password', resetPasswordConfirmLimiter, resetPasswordSubmitHandler);
+        app.get('/auth/change-password', authPageLimiter, changePasswordPageHandler);
+        app.post('/auth/change-password', changePasswordLimiter, changePasswordSubmitHandler);
         app.post('/auth', loginLimiter, loginPageHandler);
         app.get('/auth', authPageLimiter, loginPageHandler);
         app.get('/auth/complete', authPageLimiter, authCompleteHandler);

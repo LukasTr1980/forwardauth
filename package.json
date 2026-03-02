@@ -17,7 +17,7 @@
   "main": "dist/index.js",
   "scripts": {
     "start": "tsx src/index.ts",
-    "dev": "tsx watch src/index.ts",
+    "dev": "JWT_SECRET=dev-secret NODE_ENV=development INMEMORY_FALLBACK=1 node --env-file=.env ./node_modules/.bin/tsx watch src/index.ts",
     "dev:postgres": "JWT_SECRET=dev-secret NODE_ENV=development INMEMORY_FALLBACK=1 IDENTITY_DATABASE_URL=postgres://postgres:postgres@localhost:5432/forwardauth PASSKEY_ENABLED=1 PASSKEY_RP_ID=localhost PASSKEY_RP_NAME=ForwardAuth-Dev PASSKEY_ORIGIN=http://localhost:3000 tsx watch src/index.ts",
     "test": "echo \"no tests yet\"",
     "lint": "eslint . --cache",

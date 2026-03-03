@@ -2663,6 +2663,8 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         ]);
 
         const completionPath = getAuthPathWithState('/auth/complete', challengeState.loginState);
+        const authLandingPath = '/auth';
+        const fallbackAfterLogin = challengeState.loginState ? POST_LOGIN_FALLBACK_URL : `${AUTH_ORIGIN}${authLandingPath}`;
         const flowCookies = cookie.parse(req.headers.cookie ?? '');
         const loginFlowId = parseLoginFlowId(flowCookies[LOGIN_FLOW_COOKIE_NAME]);
         const intentReturnTo = challengeState.loginState && loginFlowId
@@ -2672,7 +2674,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         void recordLastSeen(user.id, {
             ip: req.ip ?? 'unknown',
             host: req.hostname || 'unknown',
-            uri: intentReturnTo ?? POST_LOGIN_FALLBACK_URL,
+            uri: intentReturnTo ?? fallbackAfterLogin,
             userAgent: getHeaderString(req as Request, 'user-agent') || 'unknown',
             platform: getHeaderString(req as Request, 'sec-ch-ua-platform') || undefined,
             via: 'login',
@@ -2682,7 +2684,7 @@ const passkeyAuthVerifyHandler: RequestHandler<ParamsDictionary, unknown, Passke
         logger.debug(`[passkey] authentication success for user "${user.email}" (${redactedCredentialId(storedCredential.credentialId)})`);
         res.status(200).json({
             ok: true,
-            redirectTo: completionPath,
+            redirectTo: challengeState.loginState ? completionPath : authLandingPath,
         });
     } catch (error) {
         const clientOrigin = getWebAuthnClientOrigin(req.body?.credential?.response?.clientDataJSON);
@@ -3140,10 +3142,11 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
     const requestHost = req.hostname;
     const loginFlowId = parseLoginFlowId(cookies[LOGIN_FLOW_COOKIE_NAME]);
     const loginState = parseLoginState(req.query.state ?? req.body?.state);
+    const authLandingUrl = `${AUTH_ORIGIN}/auth`;
     const intentReturnTo = loginFlowId && loginState
         ? await getLoginIntentReturnTo(loginFlowId, loginState)
         : null;
-    const validatedDestinationUri = intentReturnTo ?? POST_LOGIN_FALLBACK_URL;
+    const validatedDestinationUri = intentReturnTo ?? (loginState ? POST_LOGIN_FALLBACK_URL : authLandingUrl);
     const completionPath = getAuthPathWithState('/auth/complete', loginState ?? undefined);
     const setupPasskeyRequested = req.query.setup_passkey === '1';
 
@@ -3258,7 +3261,7 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
                     if (loginState) {
                         res.redirect(303, completionPath);
                     } else {
-                        res.redirect(303, validatedDestinationUri);
+                        res.redirect(303, authLandingUrl);
                     }
                     return;
                 }
@@ -3315,7 +3318,8 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             return;
         }
 
-        const safeDestinationUri = he.encode(promptPasskeySetup ? completionPath : validatedDestinationUri);
+        const postPasskeySetupDestination = loginState ? completionPath : authLandingUrl;
+        const safeDestinationUri = he.encode(promptPasskeySetup ? postPasskeySetupDestination : validatedDestinationUri);
         const loggedInBody = buildLoggedInBody(safeDestinationUri, {
             signedInUser: getJwtEmailClaim(payload) ?? currentUser.email,
             setupPasskeyPrompt: promptPasskeySetup,

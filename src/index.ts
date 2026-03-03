@@ -1358,9 +1358,6 @@ function buildLoggedInBody(safeDestinationUri: string, options: LoggedInBodyOpti
         <section class="content-stack">
             ${signedInHeadingHtml}
             <p>Sie sind erfolgreich angemeldet und können andere geschützte Dienste aufrufen.</p>
-            <div class="action-row">
-                <a class="button button--primary" href="${safeDestinationUri}">Zur geschützten Seite</a>
-            </div>
             ${changePasswordShortcut}
             ${passkeySection}
             <div class="login-actions login-actions--bottom">
@@ -3318,8 +3315,8 @@ const loginPageHandler: RequestHandler<ParamsDictionary | Record<string, never>,
             return;
         }
 
-        const safePrimaryAction = he.encode(promptPasskeySetup ? completionPath : validatedDestinationUri);
-        const loggedInBody = buildLoggedInBody(safePrimaryAction, {
+        const safeDestinationUri = he.encode(promptPasskeySetup ? completionPath : validatedDestinationUri);
+        const loggedInBody = buildLoggedInBody(safeDestinationUri, {
             signedInUser: getJwtEmailClaim(payload) ?? currentUser.email,
             setupPasskeyPrompt: promptPasskeySetup,
             autoRedirectAfterPasskeySetup: promptPasskeySetup,
